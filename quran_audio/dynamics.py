@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.ndimage import minimum_filter1d
-from scipy.signal import lfilter, resample_poly
+from scipy.signal import lfilter, upfirdn
 
 from .audio_io import _resample_filter
 
@@ -19,7 +19,6 @@ _RLB_B = [1.0, -2.0, 1.0]
 _RLB_A = [1.0, -1.99004745483398, 0.99007225036621]
 _PRE_F0, _PRE_GAIN_DB, _PRE_Q = 1681.974450955533, 3.999843853973347, 0.7071752369554196
 _RLB_F0, _RLB_Q = 38.13547087602444, 0.5003270373238773
-_OS_FILTER = _resample_filter(4, 1)
 
 
 def k_weighting_coefficients(sr: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -37,6 +36,21 @@ def k_weighting_coefficients(sr: int) -> tuple[np.ndarray, np.ndarray, np.ndarra
     rlb_b = np.array([1.0, -2.0, 1.0])
     rlb_a = np.array([1.0, 2.0 * (k1 * k1 - 1.0) / d, (1.0 - k1 / _RLB_Q + k1 * k1) / d])
     return pre_b, pre_a, rlb_b, rlb_a
+
+
+def _true_peak_filter() -> np.ndarray:
+    from scipy.signal import firwin, kaiserord
+    fc = 0.25
+    width = 0.2 * fc
+    numtaps, beta = kaiserord(60.0, width)
+    return firwin(int(numtaps) | 1, fc - width / 2.0, window=("kaiser", beta))
+
+
+# 4x oversampling for true-peak measurement: BS.1770 Annex 2 accepts a short
+# interpolation filter (its reference has 12 taps per phase); 60 dB of
+# stopband over a 20 % transition keeps the estimate within 0.1 dB at a
+# fraction of the cost of the resampling-grade filter.
+_OS_FILTER = _true_peak_filter()
 
 
 def _as_2d(x: np.ndarray) -> np.ndarray:
@@ -145,13 +159,24 @@ def integrated_loudness(x: np.ndarray, sr: int) -> float:
     return float(-0.691 + 10.0 * np.log10(np.mean(ms[gate])))
 
 
-def _true_peak_envelope(x2: np.ndarray) -> np.ndarray:
-    """Per-sample max of the 4x oversampled absolute signal, across channels."""
+def _true_peak_envelope(x2: np.ndarray, chunk: int = 1 << 20) -> np.ndarray:
+    """Per-sample max of the 4x oversampled absolute signal, across channels.
+    Computed in chunks with filter-length overlap: identical to the whole-
+    signal result, without a 4x-length temporary."""
     n = x2.shape[0]
+    h = _OS_FILTER * 4.0
+    L = len(h)
+    lead = (L - 1) // 2
     tp = np.zeros(n)
     for c in range(x2.shape[1]):
-        os = resample_poly(x2[:, c], 4, 1, window=_OS_FILTER)
-        tp = np.maximum(tp, np.abs(os[:4 * n]).reshape(n, 4).max(axis=1))
+        x = x2[:, c]
+        for s in range(0, n, chunk):
+            e = min(n, s + chunk)
+            a, b = max(0, s - L), min(n, e + L)
+            seg = upfirdn(h, x[a:b], up=4)
+            start = 4 * (s - a) + lead
+            env = np.abs(seg[start:start + 4 * (e - s)]).reshape(e - s, 4).max(axis=1)
+            tp[s:e] = np.maximum(tp[s:e], env)
     return tp
 
 
