@@ -107,7 +107,12 @@ class SpectralDenoiser:
         return ap[i - 1] * (1.0 - w)[:, None] + ap[i] * w[:, None]
 
     def __call__(self, spec: np.ndarray, m0: int) -> np.ndarray:
-        out = np.empty_like(spec)
+        return spec * self.gains(spec, m0)
+
+    def gains(self, spec: np.ndarray, m0: int) -> np.ndarray:
+        """Real gains in [floor, 1] for every coefficient of `spec`; the
+        processor state advances as if `spec` had been processed."""
+        out = np.empty(spec.shape)
         prof = self._profile_at(m0 + np.arange(spec.shape[0], dtype=np.float64))
         noise, prev_s2, pbar = self.noise, self.prev_s2, self.pbar
         lo, hi, cap = self.lo, self.hi, self.s.spp_cap
@@ -174,12 +179,11 @@ class SpectralDenoiser:
                 if fusion == "soft":
                     p = np.sqrt(p)
                 gain = np.maximum(g_lsa ** p * floor ** (1.0 - p), floor)
-            s_hat = gain * y
-            prev_s2 = s_hat.real * s_hat.real + s_hat.imag * s_hat.imag
+            prev_s2 = gain * gain * y2
             # noise update after the gain so this frame's gamma used the old estimate
             noise = a_n * noise + (1.0 - a_n) * ((1.0 - spp) * y2 + spp * noise)
             noise = np.clip(noise, lo * prof[i], hi * prof[i])
-            out[i] = s_hat
+            out[i] = gain
         self.noise, self.prev_s2, self.pbar, self.p_prev, self.prev_gs = noise, prev_s2, pbar, p_prev, prev_gs
         self.frames += spec.shape[0]
         return out
@@ -225,6 +229,30 @@ def denoise(x: np.ndarray, sr: int, analysis=None, settings: DenoiseSettings | N
     """Return (enhanced, info). `analysis` is the `Analysis` of `x` (same
     sample rate); it supplies the pause-anchored noise profile and the
     bandwidth edge. Without it a profile is taken from the quietest frames."""
+    st, proc, info = _processor(x, sr, analysis, settings)
+    y = st.process(x, proc, block_frames=block_frames)
+    info["frames"] = proc.frames
+    return y, info
+
+
+def denoise_linked(ref: np.ndarray, chans: list[np.ndarray], sr: int, analysis=None,
+                   settings: DenoiseSettings | None = None, block_frames: int = 1024) -> tuple[list[np.ndarray], dict]:
+    """Denoise several channels with one set of gains, computed from `ref`
+    (normally the mid channel, whose `analysis` is given). Keeps a stereo
+    image stable: no channel gets a decision the other did not."""
+    st, proc, info = _processor(ref, sr, analysis, settings)
+
+    def block(specs, m0):
+        g = proc.gains(specs[0], m0)
+        return [s * g for s in specs]
+
+    outs = st.process_many([ref] + list(chans), block, block_frames=block_frames)
+    info["frames"] = proc.frames
+    info["linked_channels"] = len(chans)
+    return outs[1:], info
+
+
+def _processor(x: np.ndarray, sr: int, analysis, settings: DenoiseSettings | None):
     settings = settings or DenoiseSettings()
     n_fft = frame_length_for(sr)
     st = STFT(n_fft)
@@ -251,11 +279,10 @@ def denoise(x: np.ndarray, sr: int, analysis=None, settings: DenoiseSettings | N
         tail = tail_window(st.n_frames(len(x)), analysis.offset_frames, analysis.decay_db_per_s,
                            settings.floor_db, st.hop, sr)
     proc = SpectralDenoiser(sr, n_fft, noise_psd, settings, *anchors, tail_allow_db=tail)
-    y = st.process(x, proc, block_frames=block_frames)
-    info = {"backend": "classical-omlsa", "n_fft": n_fft, "hop": st.hop, "frames": proc.frames,
+    info = {"backend": "classical-omlsa", "n_fft": n_fft, "hop": st.hop,
             "pause_anchors": int(len(proc.anchor_frames)) if anchors[0] is not None else 0, "notes": notes,
             "tail_preserve": tail is not None,
             "tail_window_s": round(float(min(3.0, (10.0 + abs(settings.floor_db)) / max(analysis.decay_db_per_s, 1e-9))), 2) if (tail is not None) else None,
             "decay_db_per_s": round(float(analysis.decay_db_per_s), 1) if analysis is not None else None}
     info.update(settings.to_dict())
-    return y, info
+    return st, proc, info

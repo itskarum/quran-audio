@@ -48,7 +48,8 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--true-peak", type=float, dest="true_peak_db", metavar="DBTP", help="ceiling (default -1)")
     g.add_argument("--sr", type=int, dest="output_sr", metavar="HZ", help="output sample rate (default: input)")
     g.add_argument("--channels", choices=["mono", "keep"], default=None, help="fold to mono (default) or keep")
-    g.add_argument("--mono", choices=["auto", "mix", "left", "right"], dest="mono_strategy", default=None)
+    g.add_argument("--mono", choices=["auto", "best", "coherent-sum", "mix", "left", "right"], dest="mono_strategy", default=None,
+                   help="how to fold stereo (default auto: measured coherence decides between coherent-sum and best)")
     g.add_argument("--subtype", dest="output_subtype", metavar="SUBTYPE", help="e.g. PCM_16, PCM_24, FLOAT")
 
 
@@ -96,10 +97,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     from .analysis import analyze
     from .audio_io import load, to_mono
     audio = load(args.input)
-    mono, strategy = to_mono(audio.samples)
+    mono, strategy, stereo_rep = to_mono(audio.samples, sr=audio.sample_rate)
     an = analyze(mono, audio.sample_rate)
     d = an.to_dict()
-    d.update({"path": str(args.input), "channels": audio.n_channels, "subtype": audio.subtype, "mono_strategy": strategy})
+    d.update({"path": str(args.input), "channels": audio.n_channels, "subtype": audio.subtype, "mono_strategy": strategy,
+              "stereo": stereo_rep.to_dict() if stereo_rep is not None else None})
     if args.json:
         print(json.dumps(d, indent=2))
         return 0

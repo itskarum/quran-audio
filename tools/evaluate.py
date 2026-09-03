@@ -77,7 +77,7 @@ def main() -> int:
     args = ap.parse_args()
 
     a = audio_io.load(args.reference)
-    mono, _ = audio_io.to_mono(a.samples)
+    mono = audio_io.to_mono(a.samples, sr=a.sample_rate)[0]
     sr = a.sample_rate
     clean = mono[int(args.start * sr):int((args.start + args.seconds) * sr)]
     clean = clean - clean.mean()

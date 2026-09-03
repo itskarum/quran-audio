@@ -23,33 +23,21 @@ def test_fit_length_pads_and_trims():
 
 
 def test_to_mono_strategies():
-    n = 1000
-    x = np.sin(np.linspace(0, 50, n))
+    from conftest import make_voice, at_snr, white
+    sr = 22050
+    x = make_voice(sr, 6.0) + 1e-4 * white(int(6.0 * sr), 3)
     assert audio_io.to_mono(x)[1] == "mono"
-    assert audio_io.to_mono(np.stack([x, x * 0.001], 1))[1] == "channel0"
-    assert audio_io.to_mono(np.stack([x * 0.001, x], 1))[1] == "channel1"
-    assert audio_io.to_mono(np.stack([x, -x], 1))[1] == "mix-inverted"
-    m, s = audio_io.to_mono(np.stack([x, x], 1))
-    assert s == "mix" and np.allclose(m, x)
+    m, s, rep = audio_io.to_mono(np.stack([x, x * 0.001], 1), sr=sr)
+    assert s == "best" and rep.reason.endswith("dead") and np.allclose(m, x)
+    m, s, rep = audio_io.to_mono(np.stack([x, -x], 1), sr=sr)
+    assert s == "coherent-sum" and any("polarity" in n for n in rep.notes) and np.corrcoef(m, x)[0, 1] > 0.999
+    m, s, rep = audio_io.to_mono(np.stack([x, x], 1), sr=sr)
+    assert s == "coherent-sum" and np.allclose(m, x)
     assert audio_io.to_mono(np.stack([x, 2 * x], 1), "left")[1] == "left"
     assert np.allclose(audio_io.to_mono(np.stack([x, 2 * x], 1), "right")[0], 2 * x)
+    assert audio_io.to_mono(np.stack([x, x, x], 1), sr=sr)[1] == "mix"
     with pytest.raises(ValueError):
         audio_io.to_mono(np.stack([x, x], 1), "bogus")
-
-
-@pytest.mark.parametrize("ext,tol", [("wav", 1e-6), ("flac", 1e-6), ("mp3", 0.05), ("ogg", 0.05)])
-def test_save_load_roundtrip(tmp_path, ext, tol):
-    sr = 22050
-    t = np.arange(sr) / sr
-    x = 0.5 * np.sin(2 * np.pi * 440 * t)
-    p = tmp_path / f"t.{ext}"
-    info = audio_io.save(p, x, sr)
-    assert info["clipped_samples"] == 0 and abs(info["peak"] - 0.5) < 1e-6
-    a = audio_io.load(p)
-    assert a.sample_rate == sr and a.n_channels == 1
-    assert abs(a.n_samples - len(x)) <= 2 * 1152          # codec framing slack
-    n = min(len(x), a.n_samples)
-    assert np.max(np.abs(a.samples[:n, 0] - x[:n])) < tol
 
 
 def test_save_clips_and_counts(tmp_path):

@@ -94,6 +94,35 @@ class STFT:
         return yp[self._pad:self._pad + n] / self._norm
 
 
+    def process_many(self, xs: list[np.ndarray],
+                     block_fn: Callable[[list[np.ndarray], int], list[np.ndarray]],
+                     block_frames: int = 2048) -> list[np.ndarray]:
+        """Like `process`, for several equal-length signals whose spectra are
+        handed to `block_fn` together (so one set of gains can be applied
+        to all of them). Returns one output per input."""
+        xs = [np.asarray(x, dtype=np.float64) for x in xs]
+        n = len(xs[0])
+        if any(len(x) != n for x in xs):
+            raise ValueError("all signals must have the same length")
+        xps = [self._padded(x) for x in xs]
+        yps = [np.zeros_like(xp) for xp in xps]
+        total = self.n_frames(n)
+        for m0 in range(0, total, block_frames):
+            m1 = min(m0 + block_frames, total)
+            specs = []
+            for xp in xps:
+                seg = xp[m0 * self.hop:(m1 - 1) * self.hop + self.n_fft]
+                frames = sliding_window_view(seg, self.n_fft)[::self.hop]
+                specs.append(np.fft.rfft(frames * self.window, axis=1))
+            outs = block_fn(specs, m0)
+            for yp, out in zip(yps, outs):
+                frames_out = np.fft.irfft(out, n=self.n_fft, axis=1) * self.window
+                for j in range(m1 - m0):
+                    start = (m0 + j) * self.hop
+                    yp[start:start + self.n_fft] += frames_out[j]
+        return [yp[self._pad:self._pad + n] / self._norm for yp in yps]
+
+
 def frame_length_for(sample_rate: int, seconds: float = 0.032, multiple: int = 64) -> int:
     """Frame length close to `seconds`, rounded to a multiple of `multiple`
     so rfft sizes stay highly composite."""

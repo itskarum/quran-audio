@@ -29,8 +29,8 @@ from . import __version__
 from .analysis import Analysis, analyze
 from .audio_io import fit_length, load, remove_dc, resample, resampled_length, save, to_mono
 from .declick import declick, declip
-from .denoise import DenoiseSettings, denoise
-from .dynamics import integrated_loudness, limiter, leveler, normalize_loudness, true_peak_dbtp
+from .denoise import DenoiseSettings, denoise, denoise_linked
+from .dynamics import integrated_loudness, limiter, leveler_gain, normalize_loudness, true_peak_dbtp
 from .eq import apply_fir, design_tonal_balance, highpass, lowpass, rumble_cutoff
 from .hum import remove_hum
 
@@ -41,7 +41,7 @@ Log = Callable[[str], None]
 class Settings:
     preset: str = "standard"
     channels: str = "mono"               # mono | keep
-    mono_strategy: str = "auto"          # auto | mix | left | right
+    mono_strategy: str = "auto"          # auto | best | coherent-sum | mix | left | right
     output_sr: int | None = None         # None = same as input
     output_subtype: str | None = None    # libsndfile subtype, e.g. PCM_24
     dc: bool = True
@@ -157,41 +157,52 @@ def _pick_backend(settings: Settings, log: Log | None):
     raise ValueError(f"unknown denoise backend {settings.denoise!r}")
 
 
-def _process_channel(x: np.ndarray, sr: int, settings: Settings, backend: str, dfn,
-                     timer: _Timer) -> tuple[np.ndarray, np.ndarray, dict, Analysis]:
-    """Run stages 1-7 on one channel. Returns (pre_eq, output, report, analysis)."""
-    rep: dict = {}
-    n = len(x)
-    if settings.dc:
-        x, offset = remove_dc(x)
-        rep["dc_offset_removed"] = round(offset, 6)
-    x_in = x
-    an = timer.run("analysis", lambda: analyze(x, sr, hum_search=settings.hum))
-    rep["notes"] = list(an.notes)
+def _process_group(chans: list[np.ndarray], sr: int, settings: Settings, backend: str, dfn,
+                   timer: _Timer) -> tuple[list[np.ndarray], list[np.ndarray], list[dict], Analysis]:
+    """Run stages 1-7 on one channel, or on a linked pair. Every decision
+    (analysis, denoiser gains, EQ, leveler gain) is taken on the mid of the
+    group and applied to all its channels, so a stereo image never wobbles.
+    Sample-domain repairs (hum, clicks, clipping) are per channel because
+    the disturbance itself differs per channel. Returns (pre_eq, output,
+    reports, analysis)."""
+    n = len(chans[0])
+    reps: list[dict] = [{} for _ in chans]
+    xs: list[np.ndarray] = []
+    for c, x in enumerate(chans):
+        if settings.dc:
+            x, offset = remove_dc(x)
+            reps[c]["dc_offset_removed"] = round(offset, 6)
+        xs.append(x)
 
-    if settings.hum and an.hum.detected:
-        x, notches = timer.run("hum", lambda: remove_hum(x, sr, an.hum, settings.hum_min_prominence_db,
-                                                       pause_ranges=an.pause_ranges))
-        rep["hum_notches"] = notches
-    else:
-        rep["hum_notches"] = []
+    def mid_of(sig: list[np.ndarray]) -> np.ndarray:
+        return sig[0] if len(sig) == 1 else np.mean(np.stack(sig, axis=0), axis=0)
 
-    do_declip = settings.declip == "on" or (settings.declip == "auto" and an.clipped_runs >= settings.declip_min_runs)
-    if do_declip:
-        x, r = timer.run("declip", lambda: declip(x, sr))
-        rep["declip"] = r.to_dict()
-    if settings.declick:
-        x, r = timer.run("declick", lambda: declick(x, sr, settings.declick_threshold, settings.declick_max_ms))
-        rep["declick"] = r.to_dict()
-    if settings.decrackle:
-        x, r = timer.run("decrackle", lambda: declick(x, sr, settings.decrackle_threshold, settings.decrackle_max_ms))
-        rep["decrackle"] = r.to_dict()
+    an = timer.run("analysis", lambda: analyze(mid_of(xs), sr, hum_search=settings.hum))
+    for c in range(len(xs)):
+        reps[c]["notes"] = list(an.notes)
+        if settings.hum and an.hum.detected:
+            xs[c], notches = timer.run("hum", lambda x=xs[c]: remove_hum(
+                x, sr, an.hum, settings.hum_min_prominence_db, pause_ranges=an.pause_ranges))
+            reps[c]["hum_notches"] = notches
+        else:
+            reps[c]["hum_notches"] = []
+        do_declip = settings.declip == "on" or (settings.declip == "auto" and an.clipped_runs >= settings.declip_min_runs)
+        if do_declip:
+            xs[c], r = timer.run("declip", lambda x=xs[c]: declip(x, sr))
+            reps[c]["declip"] = r.to_dict()
+        if settings.declick:
+            xs[c], r = timer.run("declick", lambda x=xs[c]: declick(x, sr, settings.declick_threshold, settings.declick_max_ms))
+            reps[c]["declick"] = r.to_dict()
+        if settings.decrackle:
+            xs[c], r = timer.run("decrackle", lambda x=xs[c]: declick(x, sr, settings.decrackle_threshold, settings.decrackle_max_ms))
+            reps[c]["decrackle"] = r.to_dict()
 
     # noise profile / bandwidth after the sample-domain repairs
-    an2 = timer.run("analysis", lambda: analyze(x, sr, hum_search=False))
+    ref = mid_of(xs)
+    an2 = timer.run("analysis", lambda: analyze(ref, sr, hum_search=False))
 
     if backend == "classical" and not an2.noise_measurable:
-        rep["denoise"] = {"backend": "skipped", "reason": "no measurable stationary noise", "notes": list(an2.notes)}
+        info = {"backend": "skipped", "reason": "no measurable stationary noise", "notes": list(an2.notes)}
     elif backend == "classical":
         floor_db = settings.denoise_floor_db
         if settings.denoise_adaptive:
@@ -200,26 +211,35 @@ def _process_channel(x: np.ndarray, sr: int, settings: Settings, backend: str, d
                              bandwidth_hz=an2.bandwidth_hz, fusion=settings.denoise_fusion,
                              speech_absence_prior=settings.denoise_absence_prior,
                              tail_preserve=settings.tail_preserve)
-        x, info = timer.run("denoise", lambda: denoise(x, sr, an2, ds))
+        if len(xs) == 1:
+            y, info = timer.run("denoise", lambda: denoise(xs[0], sr, an2, ds))
+            xs = [y]
+        else:
+            ys, info = timer.run("denoise", lambda: denoise_linked(ref, xs, sr, an2, ds))
+            xs = list(ys)
         info["snr_db_measured"] = round(float(an2.snr_db), 2)
         info["floor_db_effective"] = round(float(floor_db), 2)
-        rep["denoise"] = info
     elif backend == "dfn":
         from .denoise_dfn import denoise_dfn
-        x, info = timer.run("denoise", lambda: denoise_dfn(x, sr, settings.dfn_atten_lim_db, denoiser=dfn))
-        rep["denoise"] = info
+        results = [timer.run("denoise", lambda x=x: denoise_dfn(x, sr, settings.dfn_atten_lim_db, denoiser=dfn)) for x in xs]
+        xs = [r[0] for r in results]
+        info = dict(results[0][1])
+        if len(xs) > 1:
+            info["notes"] = info.get("notes", []) + ["DeepFilterNet processes channels independently (no gain linking)"]
     else:
-        rep["denoise"] = {"backend": "off"}
-    pre_eq = x
+        info = {"backend": "off"}
+    for c in range(len(xs)):
+        reps[c]["denoise"] = info
+    pres = list(xs)
 
     eq_rep: dict = {}
     if settings.highpass:
         fc = rumble_cutoff(an2.low_edge_hz)
-        x = timer.run("eq", lambda: highpass(x, sr, fc))
+        xs = [timer.run("eq", lambda x=x: highpass(x, sr, fc)) for x in xs]
         eq_rep["highpass_hz"] = round(fc, 1)
     if settings.lowpass and an2.bandwidth_hz < 0.4 * sr:
         fc = min(an2.bandwidth_hz * 1.15, 0.45 * sr)
-        x = timer.run("eq", lambda: lowpass(x, sr, fc))
+        xs = [timer.run("eq", lambda x=x: lowpass(x, sr, fc)) for x in xs]
         eq_rep["lowpass_hz"] = round(fc, 1)
     if settings.tonal_balance and an2.speech_psd is not None:
         # speech spectrum with the measured noise taken out, as the denoiser did
@@ -227,20 +247,24 @@ def _process_channel(x: np.ndarray, sr: int, settings: Settings, backend: str, d
         taps, bands = design_tonal_balance(clean_psd, an2.psd_freqs, sr, an2.low_edge_hz, an2.bandwidth_hz,
                                            settings.tonal_strength, settings.tonal_max_db)
         if taps is not None:
-            x = timer.run("eq", lambda: apply_fir(x, taps))
+            xs = [timer.run("eq", lambda x=x: apply_fir(x, taps)) for x in xs]
         eq_rep["tonal_balance"] = bands
-    rep["eq"] = eq_rep
+    for c in range(len(xs)):
+        reps[c]["eq"] = eq_rep
 
     if settings.leveler:
-        x, info = timer.run("leveler", lambda: leveler(x, sr, settings.leveler_range_db,
-                                                       attack_s=settings.leveler_attack_s,
-                                                       release_s=settings.leveler_release_s,
-                                                       window_s=settings.leveler_window_s))
-        rep["leveler"] = info
+        gain, info = timer.run("leveler", lambda: leveler_gain(mid_of(xs), sr, settings.leveler_range_db,
+                                                               attack_s=settings.leveler_attack_s,
+                                                               release_s=settings.leveler_release_s,
+                                                               window_s=settings.leveler_window_s))
+        if gain is not None:
+            xs = [x * gain for x in xs]
+        for c in range(len(xs)):
+            reps[c]["leveler"] = info
 
-    if len(x) != n or len(pre_eq) != n:
+    if any(len(x) != n for x in xs) or any(len(x) != n for x in pres):
         raise AssertionError("internal error: a stage changed the sample count")
-    return pre_eq, x, rep, an
+    return pres, xs, reps, an
 
 
 def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = None,
@@ -252,23 +276,30 @@ def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = Non
     if x.ndim == 1:
         x = x[:, None]
     n_in, ch_in = x.shape
+    stereo_rep = None
     if settings.channels == "mono":
-        mono, strategy = to_mono(x, settings.mono_strategy)
-        chans = [mono]
+        mono, strategy, stereo_rep = to_mono(x, settings.mono_strategy, sr)
+        groups = [[mono]]
+    elif ch_in == 2:
+        strategy = "keep-linked"
+        groups = [[x[:, 0], x[:, 1]]]
     else:
         strategy = "keep"
-        chans = [x[:, c] for c in range(ch_in)]
+        groups = [[x[:, c]] for c in range(ch_in)]
+    if log and stereo_rep is not None:
+        log(f"stereo: {stereo_rep.strategy} ({stereo_rep.reason})")
 
     backend, dfn, note = _pick_backend(settings, log)
-    outs, pres, reps, analyses = [], [], [], []
-    for c, xc in enumerate(chans):
-        if log and len(chans) > 1:
-            log(f"channel {c + 1}/{len(chans)}")
-        pre, out, rep, an = _process_channel(xc, sr, settings, backend, dfn, timer)
-        pres.append(pre)
-        outs.append(out)
-        reps.append(rep)
+    outs, pres, reps, analyses, chans = [], [], [], [], []
+    for g, group in enumerate(groups):
+        if log and len(groups) > 1:
+            log(f"channel group {g + 1}/{len(groups)}")
+        pre, out, rep, an = _process_group(group, sr, settings, backend, dfn, timer)
+        pres.extend(pre)
+        outs.extend(out)
+        reps.extend(rep)
         analyses.append(an)
+        chans.extend(group)
     y = np.stack(outs, axis=1)
     inputs = np.stack([remove_dc(c)[0] if settings.dc else c for c in chans], axis=1)
     residual = inputs - np.stack(pres, axis=1) if settings.residual else None
@@ -293,6 +324,7 @@ def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = Non
         "settings": settings.to_dict(),
         "input": {"sample_rate": sr, "channels": ch_in, "samples": n_in, "duration_s": round(n_in / sr, 3),
                   "mono_strategy": strategy},
+        "stereo": stereo_rep.to_dict() if stereo_rep is not None else None,
         "denoise_backend": backend, "notes": [note] if note else [],
         "analysis_before": analyses[0].to_dict(),
         "channels": reps,

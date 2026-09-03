@@ -120,35 +120,31 @@ def save(path: str | Path, samples: np.ndarray, sample_rate: int,
     return {"peak": peak, "clipped_samples": clipped}
 
 
-def to_mono(samples: np.ndarray, strategy: str = "auto") -> tuple[np.ndarray, str]:
-    """Fold (n, ch) into a 1-D signal. Returns (mono, strategy_used).
+def to_mono(samples: np.ndarray, strategy: str = "auto", sr: int | None = None):
+    """Fold (n, ch) into a 1-D signal. Returns (mono, strategy_used) and,
+    as a third element when a measurement was made, the StereoReport.
 
-    `auto` keeps a lone live channel when the other is dead (>= 20 dB
-    quieter), flips polarity before mixing if the channels are inverted,
-    and otherwise averages. Averaging near-identical dual-mono transfers
-    lowers uncorrelated noise by ~3 dB for free."""
+    Two-channel input with `auto`, `best` or `coherent-sum` goes through
+    `stereo.fold`, which measures level, delay, polarity, voice-band
+    coherence and per-channel noise floor before deciding. `mix`, `left`
+    and `right` are literal. More than two channels are averaged."""
     if samples.ndim == 1:
-        return samples, "mono"
+        return samples, "mono", None
     if samples.shape[1] == 1:
-        return samples[:, 0], "mono"
+        return samples[:, 0], "mono", None
     if strategy == "left":
-        return samples[:, 0].copy(), "left"
+        return samples[:, 0].copy(), "left", None
     if strategy == "right":
-        return samples[:, 1].copy(), "right"
+        return samples[:, 1].copy(), "right", None
     if strategy == "mix":
-        return samples.mean(axis=1), "mix"
-    if strategy != "auto":
+        return samples.mean(axis=1), "mix", None
+    if strategy not in ("auto", "best", "coherent-sum"):
         raise ValueError(f"unknown mono strategy {strategy!r}")
-    rms = np.sqrt(np.mean(samples * samples, axis=0) + 1e-20)
-    loud = int(np.argmax(rms))
-    if np.min(rms) < np.max(rms) * 10 ** (-20 / 20):
-        return samples[:, loud].copy(), f"channel{loud}"
-    if samples.shape[1] == 2:
-        left, right = samples[:, 0], samples[:, 1]
-        corr = float(np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right) + 1e-20))
-        if corr < -0.5:
-            return 0.5 * (left - right), "mix-inverted"
-    return samples.mean(axis=1), "mix"
+    if samples.shape[1] > 2:
+        return samples.mean(axis=1), "mix", None
+    from .stereo import fold
+    mono, rep = fold(samples, sr or 48000, strategy)
+    return mono, rep.strategy, rep
 
 
 def _resample_filter(up: int, down: int) -> np.ndarray:

@@ -38,6 +38,13 @@ def frame_rms_db(x: np.ndarray, sr: int, win_s: float = 0.05, hop_s: float = 0.0
 def leveler(x: np.ndarray, sr: int, range_db: float = 3.0, ratio: float = 0.5,
             attack_s: float = 0.6, release_s: float = 4.0, window_s: float = 0.4,
             speech_margin_db: float = 10.0) -> tuple[np.ndarray, dict]:
+    gain, info = leveler_gain(x, sr, range_db, ratio, attack_s, release_s, window_s, speech_margin_db)
+    return (x * gain if gain is not None else x), info
+
+
+def leveler_gain(x: np.ndarray, sr: int, range_db: float = 3.0, ratio: float = 0.5,
+                 attack_s: float = 0.6, release_s: float = 4.0, window_s: float = 0.4,
+                 speech_margin_db: float = 10.0) -> tuple[np.ndarray | None, dict]:
     """Phrase-level leveler: pulls the level of whole phrases toward the
     median speech level (2:1 at ratio 0.5), bounded to +-range_db, with
     time constants slow enough never to react inside a syllable. The gain
@@ -54,7 +61,7 @@ def leveler(x: np.ndarray, sr: int, range_db: float = 3.0, ratio: float = 0.5,
     floor = float(np.median(near)) if near.size else seed
     speech = levels > floor + speech_margin_db
     if speech.sum() < 10:
-        return x, {"applied": False, "reason": "too little speech-level material"}
+        return None, {"applied": False, "reason": "too little speech-level material"}
     target = float(np.median(levels[speech]))
     desired = np.clip((target - levels) * ratio, -range_db, range_db)
     idx = np.where(speech, np.arange(len(levels)), 0)
@@ -70,7 +77,7 @@ def leveler(x: np.ndarray, sr: int, range_db: float = 3.0, ratio: float = 0.5,
     gain = np.interp(np.arange(len(x)), centres, 10 ** (g / 20.0))
     step = max(1, int(round(0.1 / hop_s)))
     moves = int(np.count_nonzero(np.abs(g[step:] - g[:-step]) > 1.0))
-    return x * gain, {"applied": True, "target_db": round(target, 2),
+    return gain, {"applied": True, "target_db": round(target, 2),
                       "gain_min_db": round(float(g.min()), 2), "gain_max_db": round(float(g.max()), 2),
                       "moves_over_1db_per_100ms_per_s": round(moves / max(len(x) / sr, 1e-9), 3),
                       "attack_s": attack_s, "release_s": release_s, "window_s": window_s, "range_db": range_db}
