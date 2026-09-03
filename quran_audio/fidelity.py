@@ -91,10 +91,14 @@ def measure(x_in: np.ndarray, pre_eq: np.ndarray, sr: int, declick_report: dict 
     out["onsets"] = len(onsets)
     out["onset_retention_db"] = round(float(np.median([_db(b_wide[i]) - _db(a_wide[i]) for i in onsets])), 2) if len(onsets) >= 3 else None
 
-    # phrase offsets: >= 1 s speech before, >= 0.6 s without after; tail at 300 ms
+    # phrase offsets: >= 1 s speech before, >= 0.6 s without after; tail at
+    # 300 ms, counted only where the input still has a decay there (at least
+    # 3 dB above the pause floor), otherwise cutting it is noise reduction
     pre_n, post_n, k = int(1.0 * fps), int(0.6 * fps), int(0.3 * fps)
+    mid_floor = float(np.median(a_mid[pause])) if pause.sum() >= 10 else 0.0
     offsets = [i for i in range(pre_n, len(sp10) - post_n) if sp10[i - 1] and not sp10[i]
-               and sp10[i - pre_n:i].mean() > 0.9 and not sp10[i:i + post_n].any()]
+               and sp10[i - pre_n:i].mean() > 0.9 and not sp10[i:i + post_n].any()
+               and a_mid[i + k] > 2.0 * mid_floor]
     out["offsets"] = len(offsets)
     if len(offsets) >= 3:
         tail_in = np.median([_db(a_mid[i + k]) - _db(a_mid[i - 1]) for i in offsets])
