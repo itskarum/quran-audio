@@ -115,8 +115,11 @@ def test_reverb_tail_preserved(voice, sr):
     noisy = wet + at_snr(wet, white(len(wet), 12), 30)
     an = analysis.analyze(noisy, sr, hum_search=False)
     assert 15.0 <= an.decay_db_per_s <= 90.0, an.decay_db_per_s       # RT60 1.5 s is about 40 dB/s
-    y_on, info = denoise.denoise(noisy, sr, an, denoise.DenoiseSettings(floor_db=-18.0, tail_preserve=True))
-    y_off, _ = denoise.denoise(noisy, sr, an, denoise.DenoiseSettings(floor_db=-18.0, tail_preserve=False))
+    # the tail mechanism on its own (harmonic protection also keeps a
+    # decaying harmonic ladder alive, which would blur the comparison)
+    base = dict(floor_db=-18.0, harmonic_protect=False, two_step=False)
+    y_on, info = denoise.denoise(noisy, sr, an, denoise.DenoiseSettings(tail_preserve=True, **base))
+    y_off, _ = denoise.denoise(noisy, sr, an, denoise.DenoiseSettings(tail_preserve=False, **base))
     assert info["tail_preserve"]
     st = STFT(frame_length_for(sr))
     fr = st.freqs(sr)
@@ -139,3 +142,53 @@ def test_reverb_tail_preserved(voice, sr):
         assert len(cut_on) >= 2
         assert np.median(cut_on) > min_on, (ms, np.median(cut_on))
         assert np.median(cut_off) < np.median(cut_on) - min_gain, (ms, np.median(cut_off), np.median(cut_on))
+
+
+def test_pitch_tracker_and_harmonic_protection(voice, sr):
+    """The per-frame f0 lands within 3 % on a vibrato voice, pauses are
+    not called voiced, and protecting the harmonic ladder keeps far more
+    of the voice at low SNR for almost the same pause reduction."""
+    from conftest import at_snr, white, si_sdr_db
+    from quran_audio.stft import STFT, frame_length_for
+    v = voice
+    noisy = v + at_snr(v, white(len(v), 3), 12)
+    an = analysis.analyze(noisy, sr, hum_search=False)
+    st = STFT(frame_length_for(sr))
+    proc = denoise.SpectralDenoiser(sr, st.n_fft, an.noise_psd, denoise.DenoiseSettings(bandwidth_hz=an.bandwidth_hz),
+                                    an.pause_frames, an.pause_psds)
+    t = np.arange(len(v)) / sr
+    f0_true = 140.0 * (1 + 0.02 * np.sin(2 * np.pi * 5.5 * t) + 0.05 * np.sin(2 * np.pi * 0.2 * t))
+    times = st.frame_times(len(v), sr)
+    env = np.interp(times, t, np.sqrt(np.convolve(v * v, np.ones(int(0.02 * sr)) / int(0.02 * sr), "same")))
+    active = env > 10 ** (-40 / 20)
+    cands, voiced = [], []
+    for m0, power in st.power_blocks(noisy):
+        c, vd = proc._pitch(power, proc.noise)
+        cands.append(c)
+        voiced.append(vd)
+    f0 = proc.cands[np.concatenate(cands)]
+    voiced = np.concatenate(voiced)
+    ratio = f0[active & voiced] / np.interp(times, t, f0_true)[active & voiced]
+    assert voiced[active].mean() > 0.8 and voiced[~active].mean() < 0.3
+    assert abs(np.median(ratio) - 1.0) < 0.02 and np.mean(np.abs(ratio - 1) < 0.03) > 0.9
+
+    off, _ = denoise.denoise(noisy, sr, an, denoise.DenoiseSettings(floor_db=-18.0, harmonic_protect=False, two_step=False))
+    on, info = denoise.denoise(noisy, sr, an, denoise.DenoiseSettings(floor_db=-18.0, harmonic_protect=True, two_step=False))
+    assert info["voiced_fraction"] > 0.6 and abs(info["f0_mean_hz"] - 140.0) < 10.0
+    a_off = 20 * np.log10(np.dot(off, v) / np.dot(v, v))
+    a_on = 20 * np.log10(np.dot(on, v) / np.dot(v, v))
+    assert a_on > a_off + 0.8, (a_on, a_off)
+    assert si_sdr_db(v, on) > si_sdr_db(v, off) + 1.5
+
+
+def test_two_step_keeps_more_of_the_onsets(sr):
+    from conftest import at_snr, make_voice, white
+    from quran_audio import fidelity
+    voice = make_voice(sr, 30.0)
+    noisy = voice + at_snr(voice, white(len(voice), 3), 20)
+    an = analysis.analyze(noisy, sr, hum_search=False)
+    dd, _ = denoise.denoise(noisy, sr, an, denoise.DenoiseSettings(floor_db=-14.0, two_step=False))
+    ts, _ = denoise.denoise(noisy, sr, an, denoise.DenoiseSettings(floor_db=-14.0, two_step=True))
+    f_dd, f_ts = fidelity.measure(noisy, dd, sr), fidelity.measure(noisy, ts, sr)
+    assert f_dd["onsets"] >= 3 and f_ts["onset_retention_db"] > f_dd["onset_retention_db"] + 0.15
+    assert abs(f_ts["voice_band_retention_db"] - f_dd["voice_band_retention_db"]) < 0.3

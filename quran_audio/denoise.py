@@ -45,6 +45,13 @@ class DenoiseSettings:
     speech_absence_prior: float = 0.5  # q in the "xi" fusion; higher = pushes uncertain bins to the floor harder
     spp_time_smooth: float = 0.0     # recursive smoothing of the fusion probability over frames (0 = off)
     tail_preserve: bool = True       # relax the floor along the recording's own decay after each phrase
+    two_step: bool = True            # TSNR: re-estimate the a priori SNR from this frame's first estimate (no onset lag)
+    harmonic_protect: bool = True    # track f0 per frame; bins around k*f0 that are above the noise keep >= protect_db
+    protect_db: float = -3.0
+    pitch_lo_hz: float = 70.0
+    pitch_hi_hz: float = 400.0
+    pitch_max_hz: float = 5000.0     # protect harmonics up to this (and the bandwidth edge)
+    voiced_contrast_db: float = 6.0  # harmonic-vs-valley contrast needed to call a frame voiced
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -84,6 +91,62 @@ class SpectralDenoiser:
         kernel = np.hanning(2 * k + 3)[1:-1]
         self.kernel = kernel / kernel.sum()
         self.frames = 0
+        self.voiced_frames = 0
+        self.f0_sum = 0.0
+        self.bin_hz = sr / n_fft
+        self.protect_gain = 10 ** (settings.protect_db / 20.0)
+        self.protect_max_hz = min(settings.pitch_max_hz, settings.bandwidth_hz or settings.pitch_max_hz, 0.45 * sr)
+        self._init_pitch()
+
+    # ----- pitch -----------------------------------------------------------
+    def _init_pitch(self) -> None:
+        """Candidate fundamentals (1/48 octave apart) with the bins of their
+        first harmonics and of the valleys half-way between them."""
+        s = self.s
+        n_oct = np.log2(s.pitch_hi_hz / s.pitch_lo_hz)
+        self.cands = s.pitch_lo_hz * 2.0 ** np.arange(0.0, n_oct + 1e-9, 1.0 / 48)
+        K = 10
+        k = np.arange(1, K + 1)
+        fh = self.cands[:, None] * k[None, :]                      # (n_cand, K)
+        fv = self.cands[:, None] * (k[None, :] + 0.5)
+        valid = fh < min(4000.0, (self.n_bins - 2) * self.bin_hz)
+        self.pitch_valid = valid
+        self.idx_lo = np.clip(np.floor(fh / self.bin_hz).astype(int), 0, self.n_bins - 1)
+        self.idx_hi = np.clip(self.idx_lo + 1, 0, self.n_bins - 1)
+        self.idx_v = np.clip(np.rint(fv / self.bin_hz).astype(int), 0, self.n_bins - 1)
+        self.n_valid = np.maximum(valid.sum(axis=1), 1)
+        self.masks = np.stack([self._harmonic_mask(f) for f in self.cands])   # (n_cand, n_bins)
+        freqs = np.arange(self.n_bins) * self.bin_hz
+        self.voice_band = (freqs >= 100.0) & (freqs <= min(4000.0, 0.45 * self.n_bins * 2 * self.bin_hz))
+
+    def _pitch(self, power: np.ndarray, noise: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(candidate index per frame, voiced per frame) from harmonic-vs-
+        valley contrast of the log power spectrum; sub- and super-octave
+        candidates score low because their 'valleys' land on real harmonics.
+        A frame is voiced only if it also carries energy well above the
+        noise in the voice band, so pauses are never 'voiced' by chance."""
+        lp = 10.0 * np.log10(power + 1e-30)
+        H = np.maximum(lp[:, self.idx_lo], lp[:, self.idx_hi])      # (B, n_cand, K)
+        V = lp[:, self.idx_v]
+        valid = self.pitch_valid[None, :, :]
+        contrast = ((H - V) * valid).sum(axis=2) / self.n_valid[None, :]
+        best = np.argmax(contrast, axis=1)
+        score = contrast[np.arange(contrast.shape[0]), best]
+        frame_snr = power[:, self.voice_band].mean(axis=1) / max(float(noise[self.voice_band].mean()), 1e-30)
+        return best, (score >= self.s.voiced_contrast_db) & (frame_snr > 10 ** (5.0 / 10))
+
+    def _harmonic_mask(self, f0: float) -> np.ndarray:
+        k = np.arange(1, int(self.protect_max_hz / f0) + 1)
+        if len(k) == 0:
+            return np.zeros(self.n_bins, dtype=bool)
+        centres = k * f0
+        half = 0.5 * self.bin_hz + 0.015 * centres
+        lo = np.clip(np.ceil((centres - half) / self.bin_hz).astype(int), 0, self.n_bins - 1)
+        hi = np.clip(np.floor((centres + half) / self.bin_hz).astype(int), 0, self.n_bins - 1)
+        d = np.zeros(self.n_bins + 1)
+        np.add.at(d, lo, 1.0)
+        np.add.at(d, hi + 1, -1.0)
+        return np.cumsum(d)[:self.n_bins] > 0
 
     def _gain_floor(self, freqs: np.ndarray) -> np.ndarray:
         s = self.s
@@ -130,6 +193,13 @@ class SpectralDenoiser:
         tail_kernel = np.full(5, 0.2)
         prev_gs = self.prev_gs
         base_floor = floor
+        two_step = self.s.two_step
+        protect = self.s.harmonic_protect
+        if protect:
+            power_block = spec.real * spec.real + spec.imag * spec.imag
+            cand, voiced = self._pitch(power_block, noise)
+            self.voiced_frames += int(voiced.sum())
+            self.f0_sum += float(self.cands[cand[voiced]].sum())
         for i in range(spec.shape[0]):
             y = spec[i]
             floor = base_floor
@@ -152,17 +222,28 @@ class SpectralDenoiser:
             # estimate, which collapses as soon as gating starts): the
             # presence fusion below cannot gate it, so the tail fades into
             # the residual noise instead of dropping off a cliff.
-            if tail is not None:
-                # evidence that a bin is above the noise: a posteriori SNR
-                # smoothed over 5 bins and recursively over ~4 frames (the
-                # bins and frames of one STFT are correlated, so this is the
-                # least that keeps random noise peaks from opening the floor)
-                prev_gs = 0.7 * prev_gs + 0.3 * np.convolve(gamma, tail_kernel, mode="same")
-                if i < len(tail) and tail[i]:
-                    floor = np.maximum(base_floor, np.where(prev_gs > 2.5, 1.0 - 1.0 / np.maximum(prev_gs, 1.0), 0.0))
+            # evidence that a bin is above the noise: a posteriori SNR
+            # smoothed over 5 bins and recursively over ~4 frames (the bins
+            # and frames of one STFT are correlated, so this is the least
+            # that keeps random noise peaks from opening the floor)
+            prev_gs = 0.7 * prev_gs + 0.3 * np.convolve(gamma, tail_kernel, mode="same")
+            if tail is not None and i < len(tail) and tail[i]:
+                floor = np.maximum(base_floor, np.where(prev_gs > 2.5, 1.0 - 1.0 / np.maximum(prev_gs, 1.0), 0.0))
+            # a voiced frame keeps its harmonic ladder: the bins around k*f0
+            # that are above the noise are never taken below protect_db
+            if protect and voiced[i]:
+                keep = self.masks[cand[i]] & (prev_gs > 2.0)
+                floor = np.where(keep, np.maximum(floor, self.protect_gain), floor)
             # MMSE-LSA gain
             v = np.maximum(xi / (1.0 + xi) * gamma, 1e-10)
             g_lsa = np.minimum(xi / (1.0 + xi) * np.exp(0.5 * exp1(v)), 1.0)
+            if two_step:
+                # TSNR (Plapous, Marro, Scalart 2006): a second a priori SNR
+                # from this frame's first estimate removes the one-frame lag
+                # of the decision-directed rule at onsets
+                xi2 = np.maximum(g_lsa * g_lsa * gamma, xi_min)
+                v = np.maximum(xi2 / (1.0 + xi2) * gamma, 1e-10)
+                g_lsa = np.minimum(xi2 / (1.0 + xi2) * np.exp(0.5 * exp1(v)), 1.0)
             # fuse with the (frequency-smoothed) presence probability
             if fusion == "none":
                 gain = np.maximum(g_lsa, floor)
@@ -232,6 +313,7 @@ def denoise(x: np.ndarray, sr: int, analysis=None, settings: DenoiseSettings | N
     st, proc, info = _processor(x, sr, analysis, settings)
     y = st.process(x, proc, block_frames=block_frames)
     info["frames"] = proc.frames
+    info.update(_pitch_info(proc))
     return y, info
 
 
@@ -249,7 +331,15 @@ def denoise_linked(ref: np.ndarray, chans: list[np.ndarray], sr: int, analysis=N
     outs = st.process_many([ref] + list(chans), block, block_frames=block_frames)
     info["frames"] = proc.frames
     info["linked_channels"] = len(chans)
+    info.update(_pitch_info(proc))
     return outs[1:], info
+
+
+def _pitch_info(proc: SpectralDenoiser) -> dict:
+    if not proc.s.harmonic_protect or proc.frames == 0:
+        return {}
+    return {"voiced_fraction": round(proc.voiced_frames / proc.frames, 3),
+            "f0_mean_hz": round(proc.f0_sum / proc.voiced_frames, 1) if proc.voiced_frames else None}
 
 
 def _processor(x: np.ndarray, sr: int, analysis, settings: DenoiseSettings | None):
