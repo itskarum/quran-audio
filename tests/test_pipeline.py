@@ -104,3 +104,18 @@ def test_speed_correction_is_opt_in_and_reported(sr):
     assert rep["applied"] and abs(rep["speed_error_pct"] - 2.0) < 0.6
     assert abs(fixed.samples.shape[0] / len(noisy) - 1.02) < 0.005      # ran 2 % fast: slowed down, so longer
     assert not fixed.report["length_preserved"]
+
+
+def test_provenance_written_to_output(tmp_path, voice, sr):
+    from quran_audio import audio_io
+    from quran_audio.pipeline import enhance_file
+    src = tmp_path / "in.flac"
+    audio_io.save(src, voice, sr, tags={"title": "Al-Fatiha", "artist": "reciter"})
+    rep = enhance_file(src, tmp_path / "out.flac", make_settings("gentle", {"target_lufs": None}))
+    tags = audio_io.load(tmp_path / "out.flac").tags
+    assert tags["title"] == "Al-Fatiha" and tags["artist"] == "reciter"
+    assert tags["software"].startswith("quran-audio")
+    import json
+    summary = json.loads(tags["comment"])
+    assert summary["preset"] == "gentle" and "voice_band_db" in summary
+    assert rep["output"]["dithered"] is False          # 24-bit default: no dither

@@ -45,3 +45,16 @@ def test_batch(tmp_path):
 
 def test_bad_input_is_an_error_code(tmp_path):
     assert cli.main(["enhance", str(tmp_path / "nope.wav"), str(tmp_path / "o.wav"), "--quiet"]) == 1
+
+
+def test_batch_parallel_and_album(tmp_path, voice, sr):
+    from quran_audio import audio_io
+    from quran_audio.cli import main
+    src = tmp_path / "in"
+    src.mkdir()
+    audio_io.save(src / "one.wav", voice, sr)
+    audio_io.save(src / "two.wav", 0.5 * voice, sr)
+    assert main(["batch", str(src), str(tmp_path / "out"), "--jobs", "2", "--quiet", "--preset", "gentle", "--no-normalize"]) == 0
+    assert (tmp_path / "out" / "one.wav").is_file() and (tmp_path / "out" / "two.report.json").is_file()
+    assert main(["batch", str(src), str(tmp_path / "alb"), "--album", "--jobs", "2", "--quiet", "--preset", "gentle", "--ext", "flac"]) == 0
+    assert (tmp_path / "alb" / "album.json").is_file() and (tmp_path / "alb" / "two.flac").is_file()

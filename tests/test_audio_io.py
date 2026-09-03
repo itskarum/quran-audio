@@ -61,3 +61,23 @@ def test_load_errors(tmp_path):
 def test_remove_dc():
     y, off = audio_io.remove_dc(np.ones(10) * 0.25)
     assert off == 0.25 and np.allclose(y, 0)
+
+
+def test_dither_tags_and_mp3_bitrate(tmp_path):
+    sr = 22050
+    x = 1e-5 * np.sin(2 * np.pi * 440 * np.arange(sr) / sr)     # far below one 16-bit LSB
+    a = audio_io.save(tmp_path / "d.wav", x, sr, subtype="PCM_16")
+    b = audio_io.save(tmp_path / "n.wav", x, sr, subtype="PCM_16", dither=False)
+    assert a["dithered"] and not b["dithered"]
+    d = audio_io.load(tmp_path / "d.wav").samples
+    assert np.any(d != 0) and np.max(np.abs(d)) <= 3 * 2 ** -15        # +-1 LSB TPDF noise, nothing more
+    tags = {"title": "Surah 1", "artist": "reciter", "comment": "{\"preset\":\"standard\"}", "software": "quran-audio"}
+    audio_io.save(tmp_path / "t.flac", x, sr, tags=tags)
+    back = audio_io.load(tmp_path / "t.flac").tags
+    assert back["title"] == "Surah 1" and back["artist"] == "reciter" and back["comment"] == tags["comment"]
+    assert audio_io.mp3_compression_level(320) == 0.0 and audio_io.mp3_compression_level(56) == 0.9
+    assert audio_io.mp3_compression_level(192) < audio_io.mp3_compression_level(128)
+    voice = 0.3 * np.sin(2 * np.pi * 220 * np.arange(sr * 4) / sr) * (1 + 0.5 * np.sin(2 * np.pi * 3 * np.arange(sr * 4) / sr))
+    audio_io.save(tmp_path / "hi.mp3", voice, sr, mp3_kbps=256)
+    audio_io.save(tmp_path / "lo.mp3", voice, sr, mp3_kbps=64)
+    assert (tmp_path / "hi.mp3").stat().st_size > 2 * (tmp_path / "lo.mp3").stat().st_size

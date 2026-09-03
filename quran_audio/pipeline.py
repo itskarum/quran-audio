@@ -80,9 +80,17 @@ class Settings:
     true_peak_db: float = -1.0
     residual: bool = False
     speed_correct: bool = False          # opt-in: resample so the mains line sits at 50/60 Hz exactly
+    dither: bool = True                  # TPDF dither for 16-bit output
+    mp3_kbps: int = 192                  # constant bitrate for .mp3 output
+    provenance: bool = True              # write the processing summary into the output's metadata
+    # album mode: decisions shared across a set of files (set by quran_audio.album)
+    tonal_taps: np.ndarray | None = None
+    leveler_target_db: float | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d["tonal_taps"] = None if self.tonal_taps is None else f"shared ({len(self.tonal_taps)} taps)"
+        return d
 
 
 PRESETS: dict[str, dict] = {
@@ -244,7 +252,12 @@ def _process_group(chans: list[np.ndarray], sr: int, settings: Settings, backend
         fc = min(an2.bandwidth_hz * 1.15, 0.45 * sr)
         xs = [timer.run("eq", lambda x=x: lowpass(x, sr, fc)) for x in xs]
         eq_rep["lowpass_hz"] = round(fc, 1)
-    if settings.tonal_balance:
+    if settings.tonal_balance and settings.tonal_taps is not None:
+        taps = np.asarray(settings.tonal_taps, dtype=np.float64)
+        xs = [timer.run("eq", lambda x=x: apply_fir(x, taps)) for x in xs]
+        eq_rep["tonal_balance"] = "shared (album mode)"
+        eq_rep["tonal_reference"] = settings.tonal_reference
+    elif settings.tonal_balance:
         # measured on the denoised voice: what it sounds like now, with
         # nothing assumed below the residual noise
         fq, sp, nz = timer.run("analysis", lambda: speech_spectrum(mid_of(pres), sr))
@@ -263,7 +276,8 @@ def _process_group(chans: list[np.ndarray], sr: int, settings: Settings, backend
         gain, info = timer.run("leveler", lambda: leveler_gain(mid_of(xs), sr, settings.leveler_range_db,
                                                                attack_s=settings.leveler_attack_s,
                                                                release_s=settings.leveler_release_s,
-                                                               window_s=settings.leveler_window_s))
+                                                               window_s=settings.leveler_window_s,
+                                                               target_db=settings.leveler_target_db))
         if gain is not None:
             xs = [x * gain for x in xs]
         for c in range(len(xs)):
@@ -341,8 +355,12 @@ def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = Non
         analyses.append(an)
         chans.extend(group)
     y = np.stack(outs, axis=1)
-    inputs = np.stack([remove_dc(c)[0] if settings.dc else c for c in chans], axis=1)
-    residual = inputs - np.stack(pres, axis=1) if settings.residual else None
+    residual = None
+    if settings.residual:
+        inputs = np.stack([remove_dc(c)[0] if settings.dc else c for c in chans], axis=1)
+        residual = inputs - np.stack(pres, axis=1)
+        del inputs
+    del outs, pres, chans, groups, x
 
     if settings.target_lufs is not None:
         y, loud = timer.run("loudness", lambda: normalize_loudness(y, sr, settings.target_lufs, settings.true_peak_db))
@@ -380,6 +398,31 @@ def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = Non
     return Result(y, out_sr, residual, report)
 
 
+def provenance_tags(report: dict, input_tags: dict | None = None) -> dict:
+    """Container metadata for an output file: the input's own tags carried
+    over, plus a compact JSON processing summary in the comment field."""
+    import json
+    tags = dict(input_tags or {})
+    f = report.get("fidelity") or {}
+    ch = (report.get("channels") or [{}])[0]
+    summary = {
+        "tool": f"quran-audio {__version__}",
+        "preset": report["settings"].get("preset"),
+        "denoise": report.get("denoise_backend"),
+        "floor_db": ch.get("denoise", {}).get("floor_db_effective"),
+        "hum_lines": len(ch.get("hum_notches", [])),
+        "clicks": ch.get("declick", {}).get("clicks_repaired"),
+        "stereo": report.get("input", {}).get("mono_strategy"),
+        "lufs": report.get("loudness", {}).get("loudness_after_lufs"),
+        "voice_band_db": f.get("voice_band_retention_db"),
+        "onsets_db": f.get("onset_retention_db"),
+        "warnings": f.get("warnings", []),
+    }
+    tags["software"] = f"quran-audio {__version__}"
+    tags["comment"] = json.dumps(summary, separators=(",", ":"))
+    return tags
+
+
 def enhance_file(input_path: str | Path, output_path: str | Path, settings: Settings | None = None,
                  residual_path: str | Path | None = None, log: Log | None = None) -> dict:
     settings = settings or make_settings()
@@ -390,13 +433,19 @@ def enhance_file(input_path: str | Path, output_path: str | Path, settings: Sett
     if log:
         log(f"loaded {input_path}: {audio.sample_rate} Hz, {audio.n_channels} ch, {audio.duration:.1f} s, {audio.subtype}")
     result = enhance_signal(audio.samples, audio.sample_rate, settings, log)
-    written = save(output_path, result.samples, result.sample_rate, settings.output_subtype)
     report = result.report
+    tags = provenance_tags(report, audio.tags) if settings.provenance else dict(audio.tags)
+    written = save(output_path, result.samples, result.sample_rate, settings.output_subtype,
+                   dither=settings.dither, mp3_kbps=settings.mp3_kbps, tags=tags)
     report["input"]["path"] = str(input_path)
     report["input"]["subtype"] = audio.subtype
-    report["output"].update({"path": str(output_path), "clipped_samples": written["clipped_samples"]})
+    report["input"]["tags"] = dict(audio.tags)
+    report["output"].update({"path": str(output_path), "clipped_samples": written["clipped_samples"],
+                             "dithered": written["dithered"], "mp3_kbps": written["mp3_kbps"],
+                             "tags": {k: v for k, v in tags.items() if k != "comment"}})
     if residual_path is not None and result.residual is not None:
-        save(residual_path, result.residual, result.sample_rate, settings.output_subtype)
+        save(residual_path, result.residual, result.sample_rate, settings.output_subtype, dither=settings.dither,
+             mp3_kbps=settings.mp3_kbps, tags={"title": "residual: what quran-audio removed", "software": f"quran-audio {__version__}"})
         report["output"]["residual_path"] = str(residual_path)
     report["timing_s"]["total"] = round(time.perf_counter() - t0, 3)
     return report

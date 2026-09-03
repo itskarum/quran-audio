@@ -10,7 +10,7 @@ import math
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +37,13 @@ _OUTPUT_FORMATS: dict[str, tuple[str, str]] = {
 }
 
 
+TAG_FIELDS = ("title", "artist", "album", "date", "genre", "tracknumber", "copyright", "comment", "software")
+
+# libsndfile's MP3 encoder in constant-bitrate mode: compression_level -> kbps,
+# measured with this build (44.1 kHz mono). Interpolated to honour --mp3-kbps.
+_MP3_LEVEL_KBPS = [(0.0, 320.0), (0.3, 225.0), (0.6, 160.0), (0.9, 56.0)]
+
+
 @dataclass
 class Audio:
     """Decoded audio. `samples` is float64 with shape (n_samples, n_channels)."""
@@ -45,6 +52,7 @@ class Audio:
     sample_rate: int
     path: str = ""
     subtype: str = ""
+    tags: dict = field(default_factory=dict)
 
     @property
     def n_samples(self) -> int:
@@ -65,17 +73,19 @@ def load(path: str | Path) -> Audio:
     p = Path(path)
     if not p.is_file():
         raise DecodeError(f"{p}: file not found")
+    tags: dict = {}
     try:
-        info = sf.info(str(p))
+        with sf.SoundFile(str(p)) as fh:
+            subtype = str(fh.subtype)
+            tags = {k: getattr(fh, k) for k in TAG_FIELDS if getattr(fh, k)}
         data, sr = sf.read(str(p), dtype="float64", always_2d=True)
-        subtype = str(info.subtype)
     except (sf.LibsndfileError, RuntimeError, ValueError) as exc:
         data, sr, subtype = _decode_with_ffmpeg(p, exc)
     if data.shape[0] == 0:
         raise DecodeError(f"{p}: decoded zero samples")
     if not np.all(np.isfinite(data)):
         raise DecodeError(f"{p}: decoded samples contain NaN/Inf")
-    return Audio(np.ascontiguousarray(data, dtype=np.float64), int(sr), str(p), subtype)
+    return Audio(np.ascontiguousarray(data, dtype=np.float64), int(sr), str(p), subtype, tags)
 
 
 def _decode_with_ffmpeg(p: Path, original_exc: Exception) -> tuple[np.ndarray, int, str]:
@@ -96,11 +106,23 @@ def _decode_with_ffmpeg(p: Path, original_exc: Exception) -> tuple[np.ndarray, i
     return data, int(sr), "ffmpeg"
 
 
-def save(path: str | Path, samples: np.ndarray, sample_rate: int,
-         subtype: str | None = None) -> dict[str, float | int]:
-    """Encode `samples` (1-D or (n, ch)) and return {"peak", "clipped_samples"}.
+def mp3_compression_level(kbps: float) -> float:
+    levels = np.array([lv for lv, _ in _MP3_LEVEL_KBPS])
+    rates = np.array([kb for _, kb in _MP3_LEVEL_KBPS])
+    return float(np.interp(-float(kbps), -rates, levels))
 
-    Values outside [-1, 1] are clipped before PCM encoding; the count is
+
+def save(path: str | Path, samples: np.ndarray, sample_rate: int,
+         subtype: str | None = None, dither: bool = True, mp3_kbps: float | None = 192.0,
+         tags: dict | None = None) -> dict[str, float | int]:
+    """Encode `samples` (1-D or (n, ch)) and return {"peak", "clipped_samples", ...}.
+
+    16-bit (and 8-bit) PCM gets TPDF dither of +-1 LSB so quiet tails
+    decay into noise instead of truncation distortion. MP3 is written at a
+    constant bitrate (`mp3_kbps`, default 192). `tags` (title, artist,
+    album, date, comment, software, ...) go into the container's metadata
+    where the format supports it (FLAC and WAV fully, MP3 most fields).
+    Values outside [-1, 1] are clipped before encoding; the count is
     returned so the caller can surface it, because a limiter upstream
     should have made this impossible."""
     p = Path(path)
@@ -109,15 +131,34 @@ def save(path: str | Path, samples: np.ndarray, sample_rate: int,
         raise EncodeError(f"{p}: unsupported output extension {ext!r}; "
                           f"use one of {sorted(_OUTPUT_FORMATS)}")
     fmt, default_subtype = _OUTPUT_FORMATS[ext]
+    subtype = subtype or default_subtype
     data = np.asarray(samples, dtype=np.float64)
     if data.ndim == 1:
         data = data[:, None]
     peak = float(np.max(np.abs(data))) if data.size else 0.0
     clipped = int(np.count_nonzero(np.abs(data) > 1.0))
     data = np.clip(data, -1.0, 1.0)
+    dithered = False
+    bits = {"PCM_16": 16, "PCM_S8": 8, "PCM_U8": 8}.get(subtype)
+    if dither and bits:
+        rng = np.random.default_rng(0)
+        lsb = 2.0 ** (1 - bits)
+        data = np.clip(data + (rng.random(data.shape) + rng.random(data.shape) - 1.0) * lsb, -1.0, 1.0)
+        dithered = True
     p.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(p), data, int(sample_rate), subtype=subtype or default_subtype, format=fmt)
-    return {"peak": peak, "clipped_samples": clipped}
+    kwargs: dict = {}
+    if fmt == "MP3" and mp3_kbps:
+        kwargs = {"compression_level": mp3_compression_level(mp3_kbps), "bitrate_mode": "CONSTANT"}
+    with sf.SoundFile(str(p), "w", int(sample_rate), data.shape[1], subtype=subtype, format=fmt, **kwargs) as fh:
+        for key, value in (tags or {}).items():
+            if key in TAG_FIELDS and value:
+                try:
+                    setattr(fh, key, str(value))
+                except (sf.LibsndfileError, RuntimeError):
+                    pass
+        fh.write(data)
+    return {"peak": peak, "clipped_samples": clipped, "dithered": dithered,
+            "mp3_kbps": mp3_kbps if fmt == "MP3" else None}
 
 
 def to_mono(samples: np.ndarray, strategy: str = "auto", sr: int | None = None):

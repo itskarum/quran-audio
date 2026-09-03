@@ -84,7 +84,7 @@ def leveler(x: np.ndarray, sr: int, range_db: float = 3.0, ratio: float = 0.5,
 
 def leveler_gain(x: np.ndarray, sr: int, range_db: float = 3.0, ratio: float = 0.5,
                  attack_s: float = 0.6, release_s: float = 4.0, window_s: float = 0.4,
-                 speech_margin_db: float = 10.0) -> tuple[np.ndarray | None, dict]:
+                 speech_margin_db: float = 10.0, target_db: float | None = None) -> tuple[np.ndarray | None, dict]:
     """Phrase-level leveler: pulls the level of whole phrases toward the
     median speech level (2:1 at ratio 0.5), bounded to +-range_db, with
     time constants slow enough never to react inside a syllable. The gain
@@ -102,7 +102,7 @@ def leveler_gain(x: np.ndarray, sr: int, range_db: float = 3.0, ratio: float = 0
     speech = levels > floor + speech_margin_db
     if speech.sum() < 10:
         return None, {"applied": False, "reason": "too little speech-level material"}
-    target = float(np.median(levels[speech]))
+    target = float(np.median(levels[speech])) if target_db is None else float(target_db)
     desired = np.clip((target - levels) * ratio, -range_db, range_db)
     idx = np.where(speech, np.arange(len(levels)), 0)
     np.maximum.accumulate(idx, out=idx)

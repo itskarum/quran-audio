@@ -55,11 +55,16 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--mono", choices=["auto", "best", "coherent-sum", "mix", "left", "right"], dest="mono_strategy", default=None,
                    help="how to fold stereo (default auto: measured coherence decides between coherent-sum and best)")
     g.add_argument("--subtype", dest="output_subtype", metavar="SUBTYPE", help="e.g. PCM_16, PCM_24, FLOAT")
+    g.add_argument("--mp3-kbps", type=int, dest="mp3_kbps", metavar="KBPS", help="constant bitrate for .mp3 output (default 192)")
+    g.add_argument("--no-dither", dest="dither", action="store_false", default=None, help="no TPDF dither on 16-bit output")
+    g.add_argument("--no-provenance", dest="provenance", action="store_false", default=None,
+                   help="do not write the processing summary into the output's metadata")
 
 
 def _settings_from_args(args: argparse.Namespace):
     keys = ["denoise", "denoise_floor_db", "dfn_atten_lim_db", "dfn_model", "hum", "declick", "decrackle",
             "declip", "highpass", "lowpass", "tonal_balance", "tonal_strength", "tonal_reference", "leveler", "target_lufs", "speed_correct",
+            "dither", "mp3_kbps", "provenance",
             "true_peak_db", "output_sr", "channels", "mono_strategy", "output_subtype"]
     overrides = {k: getattr(args, k) for k in keys if getattr(args, k, None) is not None}
     if getattr(args, "no_normalize", False):
@@ -127,6 +132,18 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _batch_one(job: tuple) -> tuple[str, str, dict | None, str | None]:
+    """One file of a batch (runs in a worker process). Returns (src, dst,
+    report, error)."""
+    src, dst, settings, residual = job
+    try:
+        report = enhance_file(src, dst, settings, residual_path=residual)
+        Path(dst).with_suffix(".report.json").write_text(json.dumps(report, indent=2))
+        return src, dst, report, None
+    except Exception as exc:  # keep going; a batch must not die on one bad file
+        return src, dst, None, f"{type(exc).__name__}: {exc}"
+
+
 def cmd_batch(args: argparse.Namespace) -> int:
     in_dir, out_dir = Path(args.input_dir), Path(args.output_dir)
     files = sorted(p for p in (in_dir.rglob("*") if args.recursive else in_dir.iterdir())
@@ -136,25 +153,45 @@ def cmd_batch(args: argparse.Namespace) -> int:
         return 1
     settings = _settings_from_args(args)
     ext = args.ext if args.ext.startswith(".") else "." + args.ext
-    ok = failed = 0
+    jobs = max(1, int(args.jobs or 1))
     t0 = time.perf_counter()
-    for i, src in enumerate(files, 1):
+    if args.album:
+        from .album import run_album
+        if args.residuals:
+            _log("album mode does not write residuals; run the files singly for that")
+        summary = run_album([str(f) for f in files], out_dir, settings, ext=ext, jobs=jobs, log=None if args.quiet else _log)
+        warned = [f for f in summary["files"] if f["fidelity"]]
+        _log(f"done: {len(summary['files'])} files, album {summary['album_lufs']} LUFS, gain {summary['gain_db']:+.2f} dB, "
+             f"{len(warned)} with fidelity warnings, {time.perf_counter() - t0:.0f}s")
+        return 0
+    jobs_list = []
+    for src in files:
         rel = src.relative_to(in_dir)
         dst = (out_dir / rel).with_suffix(ext)
         if dst.exists() and not args.overwrite:
-            _log(f"[{i}/{len(files)}] skip (exists): {dst}")
+            _log(f"skip (exists): {dst}")
             continue
-        _log(f"[{i}/{len(files)}] {src}")
         residual = dst.with_name(dst.stem + ".residual.wav") if args.residuals else None
-        try:
-            report = enhance_file(src, dst, settings, residual_path=residual, log=None if args.quiet else _log)
-            dst.with_suffix(".report.json").write_text(json.dumps(report, indent=2))
-            if not args.quiet:
-                _summary(report)
-            ok += 1
-        except Exception as exc:  # keep going; a batch must not die on one bad file
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        jobs_list.append((str(src), str(dst), settings, str(residual) if residual else None))
+    ok = failed = 0
+    if jobs == 1:
+        iterator = map(_batch_one, jobs_list)
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+        pool = ProcessPoolExecutor(max_workers=jobs)
+        iterator = pool.map(_batch_one, jobs_list)
+    for i, (src, dst, report, error) in enumerate(iterator, 1):
+        if error:
             failed += 1
-            _log(f"FAILED {src}: {type(exc).__name__}: {exc}")
+            _log(f"[{i}/{len(jobs_list)}] FAILED {src}: {error}")
+            continue
+        ok += 1
+        _log(f"[{i}/{len(jobs_list)}] {src} -> {dst}")
+        if not args.quiet:
+            _summary(report)
+    if jobs > 1:
+        pool.shutdown()
     _log(f"done: {ok} ok, {failed} failed, {time.perf_counter() - t0:.0f}s")
     return 0 if failed == 0 else 1
 
@@ -195,6 +232,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--residuals", action="store_true", help="write a .residual.wav next to each output")
     b.add_argument("--overwrite", action="store_true")
     b.add_argument("--quiet", action="store_true")
+    b.add_argument("--jobs", type=int, default=1, metavar="N", help="files processed in parallel (default 1)")
+    b.add_argument("--album", action="store_true",
+                   help="treat the files as one set: shared tonal balance, leveler target and loudness gain")
     _add_processing_options(b)
     b.set_defaults(func=cmd_batch)
 
