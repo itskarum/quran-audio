@@ -1,0 +1,18 @@
+# virtualenvs: core tool, and the optional DeepFilterNet backend
+.venv/
+.venv-dl/
+# DeepFilterNet model cache and local scratch audio
+.cache/
+scratch/
+# python build/test leftovers
+__pycache__/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+# audio never belongs in git; keep recordings and outputs outside the tree
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.aiff

@@ -1,0 +1,51 @@
+[project]
+name = "quran-audio"
+version = "0.1.0"
+description = "Restoration tool for old, noisy Quran recitation recordings: dehum, declick, denoise, and clarify the voice without ever changing what the reciter says."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Versions verified in the dev environment on 2026-09-03:
+    # numpy 2.4.6, scipy 1.17.1, soundfile 0.14.0 (bundles libsndfile
+    # 1.2.2 with MP3/FLAC/OGG codecs). Caps stop a major bump from
+    # silently changing DSP numerics. `uv.lock` pins the exact set.
+    # numpy 1.26 is allowed only so the `dfn` extra can resolve (the
+    # deepfilternet package pins numpy < 2); the suite runs on both.
+    "numpy>=1.26,<3.0",
+    "scipy>=1.14,<2.0",
+    "soundfile>=0.13,<1.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0,<10.0",
+]
+# Optional deep denoiser (DeepFilterNet3). torch is large; on a machine
+# without a GPU install the CPU build first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# then `pip install 'quran-audio[dfn]'` and `quran-audio fetch-models`.
+dfn = [
+    "torch>=2.1,<3.0",
+    "deepfilternet==0.5.6",
+    "deepfilterlib==0.5.6",
+    "loguru>=0.7,<1.0",
+    "appdirs>=1.4,<2.0",
+]
+# Objective evaluation (tools/evaluate.py): intelligibility metric.
+eval = [
+    "pystoi>=0.4,<1.0",
+]
+
+[project.scripts]
+quran-audio = "quran_audio.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.25,<2.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["quran_audio"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
