@@ -38,6 +38,8 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--no-lowpass", dest="lowpass", action="store_false", default=None)
     g.add_argument("--no-tonal-balance", dest="tonal_balance", action="store_false", default=None)
     g.add_argument("--tonal-strength", type=float, dest="tonal_strength", metavar="0..1")
+    g.add_argument("--tonal-reference", dest="tonal_reference", metavar="REF", default=None,
+                   help="tonal-balance target: recitation (default), speech, or a clean recording of the reciter")
     g.add_argument("--leveler", dest="leveler", action="store_true", default=None,
                    help="phrase-level leveler (on in strong/broadcast; slow: 0.6 s attack, 4 s release, +-3 dB)")
     g.add_argument("--no-leveler", dest="leveler", action="store_false", default=None)
@@ -55,7 +57,7 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
 
 def _settings_from_args(args: argparse.Namespace):
     keys = ["denoise", "denoise_floor_db", "dfn_atten_lim_db", "dfn_model", "hum", "declick", "decrackle",
-            "declip", "highpass", "lowpass", "tonal_balance", "tonal_strength", "leveler", "target_lufs",
+            "declip", "highpass", "lowpass", "tonal_balance", "tonal_strength", "tonal_reference", "leveler", "target_lufs",
             "true_peak_db", "output_sr", "channels", "mono_strategy", "output_subtype"]
     overrides = {k: getattr(args, k) for k in keys if getattr(args, k, None) is not None}
     if getattr(args, "no_normalize", False):

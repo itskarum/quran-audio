@@ -26,7 +26,7 @@ from typing import Callable
 import numpy as np
 
 from . import __version__
-from .analysis import Analysis, analyze
+from .analysis import Analysis, analyze, speech_spectrum
 from .audio_io import fit_length, load, remove_dc, resample, resampled_length, save, to_mono
 from .declick import declick, declip
 from .denoise import DenoiseSettings, denoise, denoise_linked
@@ -69,6 +69,7 @@ class Settings:
     tonal_balance: bool = True
     tonal_strength: float = 0.5
     tonal_max_db: float = 6.0
+    tonal_reference: str = "recitation"   # recitation | speech | path to a clean reference recording
     tail_preserve: bool = True
     leveler: bool = False
     leveler_range_db: float = 3.0
@@ -241,14 +242,18 @@ def _process_group(chans: list[np.ndarray], sr: int, settings: Settings, backend
         fc = min(an2.bandwidth_hz * 1.15, 0.45 * sr)
         xs = [timer.run("eq", lambda x=x: lowpass(x, sr, fc)) for x in xs]
         eq_rep["lowpass_hz"] = round(fc, 1)
-    if settings.tonal_balance and an2.speech_psd is not None:
-        # speech spectrum with the measured noise taken out, as the denoiser did
-        clean_psd = np.maximum(an2.speech_psd - an2.noise_psd, 0.05 * an2.speech_psd)
-        taps, bands = design_tonal_balance(clean_psd, an2.psd_freqs, sr, an2.low_edge_hz, an2.bandwidth_hz,
-                                           settings.tonal_strength, settings.tonal_max_db)
+    if settings.tonal_balance:
+        # measured on the denoised voice: what it sounds like now, with
+        # nothing assumed below the residual noise
+        fq, sp, nz = timer.run("analysis", lambda: speech_spectrum(mid_of(pres), sr))
+        clean_psd = np.maximum(sp - nz, nz)
+        taps, bands = design_tonal_balance(clean_psd, fq, sr, an2.low_edge_hz, an2.bandwidth_hz,
+                                           settings.tonal_strength, settings.tonal_max_db,
+                                           reference=settings.tonal_reference)
         if taps is not None:
             xs = [timer.run("eq", lambda x=x: apply_fir(x, taps)) for x in xs]
         eq_rep["tonal_balance"] = bands
+        eq_rep["tonal_reference"] = settings.tonal_reference
     for c in range(len(xs)):
         reps[c]["eq"] = eq_rep
 

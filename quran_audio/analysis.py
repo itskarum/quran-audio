@@ -414,6 +414,46 @@ def _pauses(run_starts, run_ends, run_acc, st: STFT, n: int, sr: int, min_second
     return ranges, np.asarray(frames), np.asarray(psds)
 
 
+def speech_spectrum(x: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(freqs, speech_psd, noise_psd) of a signal, cheaply: mean spectra of
+    the confident speech frames and of the quietest frames. Used on the
+    denoised signal to measure what the voice actually sounds like."""
+    x = np.asarray(x, dtype=np.float64)
+    st = STFT(frame_length_for(sr))
+    freqs = st.freqs(sr)
+    band = (freqs >= 100.0) & (freqs <= min(4000.0, 0.45 * sr))
+    n_frames = st.n_frames(len(x))
+    energy = np.empty(n_frames)
+    for m0, power in st.power_blocks(x):
+        energy[m0:m0 + power.shape[0]] = power[:, band].mean(axis=1)
+    e_db = db(energy)
+    window_power = float(np.mean(st.window ** 2))
+    live = e_db > (SILENCE_DBFS + float(db(st.n_fft * window_power * 0.5)))
+    if live.sum() < 10:
+        live = np.ones_like(live)
+    floor_seed = float(np.percentile(e_db[live], 5))
+    near = e_db[live & (e_db < floor_seed + 6.0)]
+    floor = float(np.median(near)) if near.size else floor_seed
+    noise_mask = live & (e_db < floor + 4.5)
+    speech_mask = e_db > floor + 10.0
+    if not speech_mask.any():
+        speech_mask = e_db >= np.percentile(e_db, 75)
+    if noise_mask.sum() < 10:
+        noise_mask = live & (e_db <= np.percentile(e_db[live], 10))
+    sp, nz = np.zeros(st.n_bins), np.zeros(st.n_bins)
+    n_sp = n_nz = 0
+    for m0, power in st.power_blocks(x):
+        m1 = m0 + power.shape[0]
+        sm, nm = speech_mask[m0:m1], noise_mask[m0:m1]
+        if sm.any():
+            sp += power[sm].sum(axis=0)
+            n_sp += int(sm.sum())
+        if nm.any():
+            nz += power[nm].sum(axis=0)
+            n_nz += int(nm.sum())
+    return freqs, sp / max(n_sp, 1), nz / max(n_nz, 1)
+
+
 # ----- hum ----------------------------------------------------------------
 
 _HUM_RATE = 4000            # analysis rate: keeps harmonics to 1.8 kHz, long windows cheap
