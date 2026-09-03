@@ -6,7 +6,7 @@ Stage order per channel (each stage preserves sample count and alignment):
   2. hum notches            (only harmonics that were actually measured)
   3. declip                 (auto: only when clipping was detected)
   4. declick / decrackle    (AR-model detection, LSAR repair)
-  5. broadband denoise      (classical OM-LSA or DeepFilterNet3)
+  5. broadband denoise      (classical, or the experimental DeepFilterNet3 backend)
   6. voice EQ               (rumble high-pass, bandwidth low-pass, tonal balance)
   7. leveler
 then, jointly over channels:
@@ -30,6 +30,7 @@ from .analysis import Analysis, analyze, speech_spectrum
 from .audio_io import fit_length, load, remove_dc, resample, resampled_length, save, to_mono
 from .declick import declick, declip
 from .denoise import DenoiseSettings, denoise, denoise_linked
+from .breath import breath_gain
 from .dynamics import integrated_loudness, limiter, leveler_gain, normalize_loudness
 from .eq import apply_fir, design_tonal_balance, highpass, lowpass, rumble_cutoff
 from .hum import remove_hum
@@ -76,6 +77,7 @@ class Settings:
     leveler_attack_s: float = 0.6
     leveler_release_s: float = 4.0
     leveler_window_s: float = 0.4
+    breath_db: float | None = None       # opt-in: attenuate inhalations between phrases by this much (max -12)
     target_lufs: float | None = -18.0    # None = no loudness normalisation
     true_peak_db: float = -1.0
     residual: bool = False
@@ -271,6 +273,15 @@ def _process_group(chans: list[np.ndarray], sr: int, settings: Settings, backend
         eq_rep["tonal_reference"] = settings.tonal_reference
     for c in range(len(xs)):
         reps[c]["eq"] = eq_rep
+
+    if settings.breath_db is not None and settings.breath_db != 0:
+        # decided on the mid, applied to every channel, after the denoiser
+        # (a breath stands out of a cleaned floor) and before the leveler
+        gain, info = timer.run("breath", lambda: breath_gain(mid_of(xs), sr, settings.breath_db))
+        if gain is not None:
+            xs = [x * gain for x in xs]
+        for c in range(len(xs)):
+            reps[c]["breath"] = info
 
     if settings.leveler:
         gain, info = timer.run("leveler", lambda: leveler_gain(mid_of(xs), sr, settings.leveler_range_db,

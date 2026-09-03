@@ -58,3 +58,12 @@ def test_batch_parallel_and_album(tmp_path, voice, sr):
     assert (tmp_path / "out" / "one.wav").is_file() and (tmp_path / "out" / "two.report.json").is_file()
     assert main(["batch", str(src), str(tmp_path / "alb"), "--album", "--jobs", "2", "--quiet", "--preset", "gentle", "--ext", "flac"]) == 0
     assert (tmp_path / "alb" / "album.json").is_file() and (tmp_path / "alb" / "two.flac").is_file()
+
+
+def test_breath_option_reaches_the_report(tmp_path):
+    src = _write(tmp_path / "in.wav", dur=6.0)
+    out, rep = tmp_path / "out.flac", tmp_path / "rep.json"
+    assert cli.main(["enhance", str(src), str(out), "--report", str(rep), "--breath-db", "-6", "--quiet"]) == 0
+    r = json.loads(rep.read_text())
+    assert r["settings"]["breath_db"] == -6.0
+    assert r["channels"][0]["breath"]["attenuation_db"] == -6.0

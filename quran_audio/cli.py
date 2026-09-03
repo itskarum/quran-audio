@@ -23,7 +23,7 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--preset", choices=sorted(PRESETS), default="standard",
                    help="gentle: light touch; standard: balanced; strong: heavy noise and crackle")
     g.add_argument("--denoise", choices=["auto", "classical", "dfn", "off"], default=None,
-                   help="broadband denoiser (default classical); dfn = DeepFilterNet3, opt-in: it also removes reverb")
+                   help="broadband denoiser (default classical); dfn = DeepFilterNet3, experimental and opt-in: it also removes reverb")
     g.add_argument("--denoise-floor", type=float, dest="denoise_floor_db", metavar="DB",
                    help="classical backend: deepest attenuation in the voice band, e.g. -18")
     g.add_argument("--dfn-atten-lim", type=float, dest="dfn_atten_lim_db", metavar="DB",
@@ -43,6 +43,8 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--leveler", dest="leveler", action="store_true", default=None,
                    help="phrase-level leveler (on in strong/broadcast; slow: 0.6 s attack, 4 s release, +-3 dB)")
     g.add_argument("--no-leveler", dest="leveler", action="store_false", default=None)
+    g.add_argument("--breath-db", type=float, dest="breath_db", metavar="DB",
+                   help="attenuate inhalations between phrases by this much, e.g. -6 (never more than -12; off by default)")
     g.add_argument("--speed-correct", dest="speed_correct", action="store_true", default=None,
                    help="resample so the mains line sits at 50/60 Hz exactly (changes pitch, tempo and length: opt-in)")
     g.add_argument("--no-tail-preserve", dest="tail_preserve", action="store_false", default=None,
@@ -64,7 +66,7 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
 def _settings_from_args(args: argparse.Namespace):
     keys = ["denoise", "denoise_floor_db", "dfn_atten_lim_db", "dfn_model", "hum", "declick", "decrackle",
             "declip", "highpass", "lowpass", "tonal_balance", "tonal_strength", "tonal_reference", "leveler", "target_lufs", "speed_correct",
-            "dither", "mp3_kbps", "provenance",
+            "dither", "mp3_kbps", "provenance", "breath_db",
             "true_peak_db", "output_sr", "channels", "mono_strategy", "output_subtype"]
     overrides = {k: getattr(args, k) for k in keys if getattr(args, k, None) is not None}
     if getattr(args, "no_normalize", False):

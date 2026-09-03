@@ -7,6 +7,15 @@ synthesise speech, which is why it is acceptable here where generative
 "restoration" models are not. The optional attenuation limit caps how
 deep it may cut, keeping a natural residual on very old material.
 
+Status: experimental and opt-in. Besides noise the model removes
+reverberation (about 9 dB of room energy on a reverberant hall
+recording), its level guard and the 30 s chunk crossfades have been
+exercised in one environment only, and it is not part of the fidelity
+bounds the classical backend is held to. If its deeper pause cleaning is
+ever wanted, the sound way to use it is as a second opinion, applying its
+gains only where the classical stage already says "noise", not as a
+replacement.
+
 The Python package on PyPI (deepfilternet 0.5.6) is unmaintained: its
 audio-I/O helper imports torchaudio APIs that no longer exist, and its
 metadata pins numpy < 2. We never use that helper, so when `df.io` fails

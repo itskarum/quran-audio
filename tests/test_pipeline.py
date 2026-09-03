@@ -119,3 +119,30 @@ def test_provenance_written_to_output(tmp_path, voice, sr):
     summary = json.loads(tags["comment"])
     assert summary["preset"] == "gentle" and "voice_band_db" in summary
     assert rep["output"]["dithered"] is False          # 24-bit default: no dither
+
+
+def test_breath_attenuation_is_opt_in_and_leaves_the_voice(sr):
+    from conftest import make_voice
+    v = make_voice(sr, 24.0)
+    noisy = v + at_snr(v, white(len(v), 2), 45)
+    rng = np.random.default_rng(9)
+    sos = butter(4, [500, 4000], btype="band", fs=sr, output="sos")
+    inserted = []
+    for start in (4.15, 9.15, 14.15, 19.15):
+        a, b = int(start * sr), int((start + 0.3) * sr)
+        noisy[a:b] += sosfiltfilt(sos, rng.standard_normal(b - a)) * 10 ** (-32 / 20) * np.hanning(b - a)
+        inserted.append((a, b))
+    plain = enhance_signal(noisy, sr, make_settings("standard", {"target_lufs": None}))
+    assert "breath" not in plain.report["channels"][0]
+    soft = enhance_signal(noisy, sr, make_settings("standard", {"target_lufs": None, "breath_db": -6.0}))
+    info = soft.report["channels"][0]["breath"]
+    assert info["count"] >= 3 and info["attenuation_db"] == -6.0
+    for a, b in inserted[:3]:
+        mid = slice(a + int(0.08 * sr), b - int(0.08 * sr))
+        drop = 20 * np.log10(np.std(soft.samples[mid, 0]) / np.std(plain.samples[mid, 0]))
+        assert abs(drop + 6.0) < 1.5, drop
+    voiced = slice(int(1.0 * sr), int(3.5 * sr))
+    assert np.array_equal(soft.samples[voiced], plain.samples[voiced])
+    # never more than -12 dB, whatever is asked
+    deep = enhance_signal(noisy, sr, make_settings("standard", {"target_lufs": None, "breath_db": -30.0}))
+    assert deep.report["channels"][0]["breath"]["attenuation_db"] == -12.0
