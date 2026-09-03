@@ -35,15 +35,22 @@ def frame_rms_db(x: np.ndarray, sr: int, win_s: float = 0.05, hop_s: float = 0.0
     return centres, levels
 
 
-def leveler(x: np.ndarray, sr: int, range_db: float = 6.0, ratio: float = 0.5,
-            attack_s: float = 0.1, release_s: float = 1.5,
+def leveler(x: np.ndarray, sr: int, range_db: float = 3.0, ratio: float = 0.5,
+            attack_s: float = 0.6, release_s: float = 4.0, window_s: float = 0.4,
             speech_margin_db: float = 10.0) -> tuple[np.ndarray, dict]:
-    """Gently pull speech frames toward their median level (a 2:1 leveler at
-    ratio 0.5), bounded to +-range_db. The gain freezes during pauses so
-    residual noise is never pumped up between phrases."""
-    centres, levels = frame_rms_db(x, sr)
-    seed = float(np.percentile(levels, 5))
-    near = levels[levels < seed + 6.0]
+    """Phrase-level leveler: pulls the level of whole phrases toward the
+    median speech level (2:1 at ratio 0.5), bounded to +-range_db, with
+    time constants slow enough never to react inside a syllable. The gain
+    freezes during pauses so residual noise is never pumped up between
+    phrases. A reciter's crescendo toward the end of an ayah and the fall
+    at waqf happen over seconds; this follows those, not the syllables."""
+    hop_s = 0.01
+    centres, levels = frame_rms_db(x, sr, win_s=window_s, hop_s=hop_s)
+    # the noise floor is read with short frames (a 400 ms window rarely fits
+    # inside a breath pause); the leveling itself uses the long window
+    fine = frame_rms_db(x, sr, win_s=0.05, hop_s=hop_s)[1]
+    seed = float(np.percentile(fine, 5))
+    near = fine[fine < seed + 6.0]
     floor = float(np.median(near)) if near.size else seed
     speech = levels > floor + speech_margin_db
     if speech.sum() < 10:
@@ -53,7 +60,6 @@ def leveler(x: np.ndarray, sr: int, range_db: float = 6.0, ratio: float = 0.5,
     idx = np.where(speech, np.arange(len(levels)), 0)
     np.maximum.accumulate(idx, out=idx)
     held = np.where(speech[idx], desired[idx], 0.0)
-    hop_s = 0.01
     c_att = 1.0 - np.exp(-hop_s / attack_s)
     c_rel = 1.0 - np.exp(-hop_s / release_s)
     g = np.empty_like(held)
@@ -62,8 +68,12 @@ def leveler(x: np.ndarray, sr: int, range_db: float = 6.0, ratio: float = 0.5,
         prev += (d - prev) * (c_att if d < prev else c_rel)
         g[i] = prev
     gain = np.interp(np.arange(len(x)), centres, 10 ** (g / 20.0))
+    step = max(1, int(round(0.1 / hop_s)))
+    moves = int(np.count_nonzero(np.abs(g[step:] - g[:-step]) > 1.0))
     return x * gain, {"applied": True, "target_db": round(target, 2),
-                      "gain_min_db": round(float(g.min()), 2), "gain_max_db": round(float(g.max()), 2)}
+                      "gain_min_db": round(float(g.min()), 2), "gain_max_db": round(float(g.max()), 2),
+                      "moves_over_1db_per_100ms_per_s": round(moves / max(len(x) / sr, 1e-9), 3),
+                      "attack_s": attack_s, "release_s": release_s, "window_s": window_s, "range_db": range_db}
 
 
 # ----- loudness -----------------------------------------------------------

@@ -57,7 +57,7 @@ class Settings:
     declip_min_runs: int = 20
     denoise: str = "auto"                # auto (= classical) | classical | dfn | off
     denoise_floor_db: float = -18.0      # deepest floor, used at <= 16 dB measured SNR
-    denoise_floor_min_db: float = -8.0   # lightest floor, used at >= 28 dB measured SNR
+    denoise_floor_min_db: float = -12.0  # lightest floor, used at 28 dB measured SNR (half of it at 40 dB)
     denoise_adaptive: bool = True        # scale the floor with the measured SNR
     denoise_hf_floor_db: float = -40.0
     denoise_fusion: str = "soft"
@@ -69,8 +69,12 @@ class Settings:
     tonal_balance: bool = True
     tonal_strength: float = 0.5
     tonal_max_db: float = 6.0
-    leveler: bool = True
-    leveler_range_db: float = 6.0
+    tail_preserve: bool = True
+    leveler: bool = False
+    leveler_range_db: float = 3.0
+    leveler_attack_s: float = 0.6
+    leveler_release_s: float = 4.0
+    leveler_window_s: float = 0.4
     target_lufs: float | None = -18.0    # None = no loudness normalisation
     true_peak_db: float = -1.0
     residual: bool = False
@@ -80,13 +84,17 @@ class Settings:
 
 
 PRESETS: dict[str, dict] = {
-    "gentle": dict(declick_threshold=7.0, decrackle=False, denoise_floor_db=-12.0, denoise_floor_min_db=-6.0,
+    "gentle": dict(declick_threshold=7.0, decrackle=False, denoise_floor_db=-12.0, denoise_floor_min_db=-8.0,
                    denoise_hf_floor_db=-30.0, dfn_atten_lim_db=20.0, tonal_strength=0.3,
-                   tonal_max_db=4.0, leveler=False),
+                   tonal_max_db=4.0),
     "standard": {},
-    "strong": dict(declick_threshold=5.0, decrackle=True, denoise_floor_db=-28.0, denoise_floor_min_db=-14.0,
+    "strong": dict(declick_threshold=5.0, decrackle=True, denoise_floor_db=-28.0, denoise_floor_min_db=-16.0,
                    denoise_hf_floor_db=-50.0, dfn_atten_lim_db=None, tonal_strength=0.7,
-                   tonal_max_db=9.0, leveler_range_db=8.0),
+                   tonal_max_db=9.0, leveler=True, leveler_range_db=4.0),
+    # broadcast: for playback on small speakers and streaming, where an even
+    # level matters more than the reciter's dynamics. This is compression.
+    "broadcast": dict(leveler=True, leveler_range_db=6.0, leveler_attack_s=0.3, leveler_release_s=2.0,
+                      leveler_window_s=0.2, target_lufs=-16.0),
 }
 
 
@@ -190,7 +198,8 @@ def _process_channel(x: np.ndarray, sr: int, settings: Settings, backend: str, d
             floor_db = adaptive_floor_db(settings.denoise_floor_db, settings.denoise_floor_min_db, an2.snr_db)
         ds = DenoiseSettings(floor_db=floor_db, hf_floor_db=settings.denoise_hf_floor_db,
                              bandwidth_hz=an2.bandwidth_hz, fusion=settings.denoise_fusion,
-                             speech_absence_prior=settings.denoise_absence_prior)
+                             speech_absence_prior=settings.denoise_absence_prior,
+                             tail_preserve=settings.tail_preserve)
         x, info = timer.run("denoise", lambda: denoise(x, sr, an2, ds))
         info["snr_db_measured"] = round(float(an2.snr_db), 2)
         info["floor_db_effective"] = round(float(floor_db), 2)
@@ -223,7 +232,10 @@ def _process_channel(x: np.ndarray, sr: int, settings: Settings, backend: str, d
     rep["eq"] = eq_rep
 
     if settings.leveler:
-        x, info = timer.run("leveler", lambda: leveler(x, sr, settings.leveler_range_db))
+        x, info = timer.run("leveler", lambda: leveler(x, sr, settings.leveler_range_db,
+                                                       attack_s=settings.leveler_attack_s,
+                                                       release_s=settings.leveler_release_s,
+                                                       window_s=settings.leveler_window_s))
         rep["leveler"] = info
 
     if len(x) != n or len(pre_eq) != n:

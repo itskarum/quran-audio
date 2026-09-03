@@ -44,6 +44,7 @@ class DenoiseSettings:
     fusion: str = "soft"             # "soft" (sqrt of fixed-prior SPP), "spp" (OM-LSA), "xi" (from tracked a priori SNR), "none"
     speech_absence_prior: float = 0.5  # q in the "xi" fusion; higher = pushes uncertain bins to the floor harder
     spp_time_smooth: float = 0.0     # recursive smoothing of the fusion probability over frames (0 = off)
+    tail_preserve: bool = True       # relax the floor along the recording's own decay after each phrase
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -53,8 +54,10 @@ class SpectralDenoiser:
     """Stateful frame-by-frame processor; call it from STFT.process()."""
 
     def __init__(self, sr: int, n_fft: int, noise_psd: np.ndarray, settings: DenoiseSettings,
-                 anchor_frames: np.ndarray | None = None, anchor_psds: np.ndarray | None = None) -> None:
+                 anchor_frames: np.ndarray | None = None, anchor_psds: np.ndarray | None = None,
+                 tail_allow_db: np.ndarray | None = None) -> None:
         self.s = settings
+        self.tail_allow_db = tail_allow_db
         self.n_bins = n_fft // 2 + 1
         freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
         noise_psd = np.asarray(noise_psd, dtype=np.float64)
@@ -71,6 +74,7 @@ class SpectralDenoiser:
         self.hi = 10 ** (settings.profile_bounds_db[1] / 10)
         self.noise = self._profile_at(np.zeros(1))[0]
         self.prev_s2 = np.zeros(self.n_bins)
+        self.prev_gs = np.ones(self.n_bins)
         self.pbar = np.full(self.n_bins, 0.5)
         self.p_prev = np.zeros(self.n_bins)
         self.xi_h1 = 10 ** (settings.spp_prior_snr_db / 10)
@@ -117,8 +121,13 @@ class SpectralDenoiser:
         q_ratio = q / max(1.0 - q, 1e-6)
         a_p = float(np.clip(self.s.spp_time_smooth, 0.0, 0.99))
         p_prev = self.p_prev
+        tail = self.tail_allow_db[m0:m0 + spec.shape[0]] if self.tail_allow_db is not None else None
+        tail_kernel = np.full(5, 0.2)
+        prev_gs = self.prev_gs
+        base_floor = floor
         for i in range(spec.shape[0]):
             y = spec[i]
+            floor = base_floor
             y2 = y.real * y.real + y.imag * y.imag
             gamma = y2 / noise
             # speech presence probability with a fixed prior (P(H1) = 0.5)
@@ -131,6 +140,21 @@ class SpectralDenoiser:
             prev = maximum_filter1d(prev_s2, 2 * track + 1, mode="nearest") if track else prev_s2
             xi = a_dd * prev / noise + (1.0 - a_dd) * np.maximum(gamma - 1.0, 0.0)
             xi = np.maximum(xi, xi_min)
+            # After a phrase ends the room (or a held note) decays into the
+            # noise. While the tail window is open, any bin still above the
+            # noise keeps at least the spectral-subtraction gain 1 - 1/gamma
+            # (from the instantaneous evidence, not the decision-directed
+            # estimate, which collapses as soon as gating starts): the
+            # presence fusion below cannot gate it, so the tail fades into
+            # the residual noise instead of dropping off a cliff.
+            if tail is not None:
+                # evidence that a bin is above the noise: a posteriori SNR
+                # smoothed over 5 bins and recursively over ~4 frames (the
+                # bins and frames of one STFT are correlated, so this is the
+                # least that keeps random noise peaks from opening the floor)
+                prev_gs = 0.7 * prev_gs + 0.3 * np.convolve(gamma, tail_kernel, mode="same")
+                if i < len(tail) and tail[i]:
+                    floor = np.maximum(base_floor, np.where(prev_gs > 2.5, 1.0 - 1.0 / np.maximum(prev_gs, 1.0), 0.0))
             # MMSE-LSA gain
             v = np.maximum(xi / (1.0 + xi) * gamma, 1e-10)
             g_lsa = np.minimum(xi / (1.0 + xi) * np.exp(0.5 * exp1(v)), 1.0)
@@ -156,9 +180,26 @@ class SpectralDenoiser:
             noise = a_n * noise + (1.0 - a_n) * ((1.0 - spp) * y2 + spp * noise)
             noise = np.clip(noise, lo * prof[i], hi * prof[i])
             out[i] = s_hat
-        self.noise, self.prev_s2, self.pbar, self.p_prev = noise, prev_s2, pbar, p_prev
+        self.noise, self.prev_s2, self.pbar, self.p_prev, self.prev_gs = noise, prev_s2, pbar, p_prev, prev_gs
         self.frames += spec.shape[0]
         return out
+
+
+def tail_window(n_frames: int, offset_frames, decay_db_per_s: float, floor_db: float,
+                hop: int, sr: int, max_seconds: float = 3.0) -> np.ndarray | None:
+    """Boolean per-frame mask: True while a phrase's decay can still be
+    above the noise, i.e. from each speech offset for as long as the
+    recording's own decay rate needs to fall from the speech threshold
+    (10 dB over the floor) to the preset floor."""
+    if offset_frames is None or len(offset_frames) == 0 or decay_db_per_s <= 0:
+        return None
+    seconds = min(max_seconds, (10.0 + abs(floor_db)) / decay_db_per_s)
+    length = max(1, int(np.ceil(seconds * sr / hop)))
+    active = np.zeros(n_frames, dtype=bool)
+    for m in np.asarray(offset_frames, dtype=int):
+        if 0 <= m < n_frames:
+            active[m:min(n_frames, m + length)] = True
+    return active
 
 
 def noise_profile(x: np.ndarray, st: STFT, quantile: float = 0.2) -> np.ndarray:
@@ -205,9 +246,16 @@ def denoise(x: np.ndarray, sr: int, analysis=None, settings: DenoiseSettings | N
             settings = DenoiseSettings(**{**settings.to_dict(), **overrides})
     else:
         noise_psd = noise_profile(x, st)
-    proc = SpectralDenoiser(sr, n_fft, noise_psd, settings, *anchors)
+    tail = None
+    if settings.tail_preserve and analysis is not None and getattr(analysis, "offset_frames", None) is not None:
+        tail = tail_window(st.n_frames(len(x)), analysis.offset_frames, analysis.decay_db_per_s,
+                           settings.floor_db, st.hop, sr)
+    proc = SpectralDenoiser(sr, n_fft, noise_psd, settings, *anchors, tail_allow_db=tail)
     y = st.process(x, proc, block_frames=block_frames)
     info = {"backend": "classical-omlsa", "n_fft": n_fft, "hop": st.hop, "frames": proc.frames,
-            "pause_anchors": int(len(proc.anchor_frames)) if anchors[0] is not None else 0, "notes": notes}
+            "pause_anchors": int(len(proc.anchor_frames)) if anchors[0] is not None else 0, "notes": notes,
+            "tail_preserve": tail is not None,
+            "tail_window_s": round(float(min(3.0, (10.0 + abs(settings.floor_db)) / max(analysis.decay_db_per_s, 1e-9))), 2) if (tail is not None) else None,
+            "decay_db_per_s": round(float(analysis.decay_db_per_s), 1) if analysis is not None else None}
     info.update(settings.to_dict())
     return y, info

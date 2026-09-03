@@ -44,3 +44,27 @@ def test_leveler_reduces_spread(voice, sr):
     assert spread(y) < spread(drift) - 2
     silent, info2 = dynamics.leveler(np.zeros(sr), sr)
     assert not info2["applied"]
+
+
+def test_leveler_is_phrase_level():
+    """The leveler follows phrases (seconds), never syllables (100 ms), and
+    stays inside its +-3 dB range."""
+    sr = 22050
+    t = np.arange(int(8 * sr)) / sr
+    carrier = np.sin(2 * np.pi * 200 * t) + 0.5 * np.sin(2 * np.pi * 400 * t)
+    syllables = 0.55 + 0.45 * np.sin(2 * np.pi * 4.0 * t) ** 2        # ~9 dB swing at 4 Hz
+    level = np.where(t < 4.0, 1.0, 10 ** (-10 / 20))                   # a 10 dB phrase step at 4 s
+    for a in (1.8, 3.8, 5.8):                                          # breath pauses, so a real floor exists
+        level[int(a * sr):int((a + 0.4) * sr)] = 0.0
+    x = 0.3 * carrier * syllables * level + 1e-3 * np.random.default_rng(0).standard_normal(len(t))
+    y, info = dynamics.leveler(x, sr)
+    assert info["applied"] and info["moves_over_1db_per_100ms_per_s"] < 0.3
+    win, hop = int(0.05 * sr), int(0.01 * sr)
+    rx = np.sqrt(np.mean(np.lib.stride_tricks.sliding_window_view(x, win)[::hop] ** 2, axis=1))
+    ry = np.sqrt(np.mean(np.lib.stride_tricks.sliding_window_view(y, win)[::hop] ** 2, axis=1))
+    g = 20 * np.log10(ry / rx)
+    assert np.all(np.abs(g) <= 3.05)
+    i_step = int(4.2 / 0.01)                                  # the quiet phrase starts after the pause at 3.8-4.2 s
+    assert abs(g[i_step + 10] - g[i_step]) < 0.6              # nothing happens inside the first 100 ms
+    assert g[i_step + 150] - g[i_step - 60] > 1.0             # but the quiet phrase is lifted within 1.5 s
+    assert np.std(g[60:170]) < 0.4 and np.std(g[640:760]) < 0.4   # syllables are not chased

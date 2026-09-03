@@ -64,6 +64,8 @@ class Analysis:
     anchors_reliable: bool = True
     noise_measurable: bool = True
     silent_fraction: float = 0.0
+    decay_db_per_s: float = 60.0
+    offset_frames: np.ndarray | None = field(default=None, repr=False)
     notes: list[str] = field(default_factory=list)
     pause_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
     psd_freqs: np.ndarray | None = field(default=None, repr=False)
@@ -93,6 +95,8 @@ class Analysis:
             "hum": self.hum.to_dict(),
             "anchors_reliable": self.anchors_reliable,
             "noise_measurable": self.noise_measurable,
+            "decay_db_per_s": round(self.decay_db_per_s, 1),
+            "speech_offsets": int(len(self.offset_frames)) if self.offset_frames is not None else 0,
             "silent_fraction": round(self.silent_fraction, 3),
             "notes": list(self.notes),
         }
@@ -142,14 +146,10 @@ def analyze(x: np.ndarray, sr: int, hum_search: bool = True) -> Analysis:
     band = (freqs >= 100.0) & (freqs <= min(4000.0, 0.45 * sr))
     n_frames = st.n_frames(n)
 
-    # pass 1: per-frame in-band energy, plus the top of the spectrum as a
-    # noise-only proxy (no recitation has energy above 0.8 x Nyquist)
-    hf = freqs >= 0.8 * (sr / 2.0)
+    # pass 1: per-frame in-band energy
     band_energy = np.empty(n_frames)
-    hf_energy = np.empty(n_frames)
     for m0, power in st.power_blocks(x):
         band_energy[m0:m0 + power.shape[0]] = power[:, band].mean(axis=1)
-        hf_energy[m0:m0 + power.shape[0]] = power[:, hf].mean(axis=1) if hf.any() else 0.0
     e_db = db(band_energy)
     window_power = float(np.mean(st.window ** 2))
     dbfs_offset = float(db(st.n_fft * window_power * 0.5))   # e_db - dbfs_offset ~ frame RMS in dBFS
@@ -173,9 +173,23 @@ def analyze(x: np.ndarray, sr: int, hum_search: bool = True) -> Analysis:
     if not speech_mask.any():             # very low SNR or silence: take the top quarter
         speech_mask = e_db >= np.percentile(e_db, 75)
 
+    # Phrase offsets and the recording's own decay rate. The first half
+    # second of every pause is the tail of the room (or of a held note),
+    # not noise: it is kept out of the noise statistics.
+    fps = sr / st.hop
+    offset_frames, decay = _offsets_and_decay(speech_mask, e_db, fps)
+    rs_full, re_full = _runs(noise_mask)
+    pause_ranges = _ranges(rs_full, re_full, st, n, sr)
+    core_mask = noise_mask.copy()
+    n_excl, n_keep = int(round(0.5 * fps)), int(round(0.3 * fps))
+    for s0, e0 in zip(rs_full, re_full):
+        core_mask[s0:s0 + min(n_excl, max(0, (e0 - s0) - n_keep))] = False
+    if core_mask.sum() < 10:
+        core_mask = noise_mask
+
     # pass 2: mean spectra of confident noise / speech frames, plus one
     # spectrum per pause (run of noise frames) for time-varying profiles
-    run_starts, run_ends = _runs(noise_mask)
+    run_starts, run_ends = _runs(core_mask)
     run_id = np.full(n_frames, -1, dtype=np.int64)
     for k, (s0, e0) in enumerate(zip(run_starts, run_ends)):
         run_id[s0:e0] = k
@@ -185,7 +199,7 @@ def analyze(x: np.ndarray, sr: int, hum_search: bool = True) -> Analysis:
     n_noise = n_speech = 0
     for m0, power in st.power_blocks(x):
         m1 = m0 + power.shape[0]
-        nm, sm = noise_mask[m0:m1], speech_mask[m0:m1]
+        nm, sm = core_mask[m0:m1], speech_mask[m0:m1]
         if nm.any():
             noise_psd += power[nm].sum(axis=0)
             n_noise += int(nm.sum())
@@ -197,25 +211,16 @@ def analyze(x: np.ndarray, sr: int, hum_search: bool = True) -> Analysis:
             n_speech += int(sm.sum())
     noise_psd /= max(n_noise, 1)
     speech_psd /= max(n_speech, 1)
-    pause_ranges, pause_frames, pause_psds = _pauses(run_starts, run_ends, run_acc, st, n, sr)
+    _, pause_frames, pause_psds = _pauses(run_starts, run_ends, run_acc, st, n, sr, min_seconds=0.25)
 
-    # Gated pauses: if the noise heard inside speech (top-of-band proxy, 5th
-    # percentile over speech frames) sits well above what the pauses show,
-    # the transfer was gated or muted between phrases and the pause
-    # spectrum under-states the noise. Fall back to minimum statistics.
     anchors_reliable = pause_frames is not None and len(pause_frames) >= 1
-    if hf.any() and speech_mask.sum() >= 20 and noise_mask.sum() >= 10:
-        speech_hf = float(np.percentile(hf_energy[speech_mask], 5))
-        pause_hf = float(np.mean(hf_energy[noise_mask]))
-        if db(speech_hf) > db(pause_hf) + 10.0:
-            anchors_reliable = False
-            notes.append("pauses are far quieter than the noise inside speech (gated transfer); "
-                         "noise profile taken from minimum statistics instead")
     noise_measurable = True
-    # Muted or gated gaps leave quiet voice as the quietest live frames.
-    # Against the valley floor (the stationary noise read between the
-    # harmonics), a genuine pause spectrum sits within a couple of dB; quiet
-    # voice sits far above it. The median across bins ignores hum lines.
+    # The valley floor is the stationary noise read between the harmonics
+    # inside speech. A genuine pause spectrum sits within a few dB of it.
+    # Far above it, the quietest frames are quiet voice (muted gaps left no
+    # real pause); far below it, the pauses were gated and under-state the
+    # noise heard inside speech. Either way the valley floor is the better
+    # profile. The median across bins ignores hum lines.
     valley = _valley_noise_profile(x, sr, freqs, float(np.sum(st.window ** 2)))
     if valley is not None and n_noise >= 10:
         voice_band = (freqs >= 200.0) & (freqs <= 2000.0)
@@ -224,6 +229,10 @@ def analyze(x: np.ndarray, sr: int, hum_search: bool = True) -> Analysis:
             anchors_reliable = False
             pause_ranges = []
             notes.append("the quietest frames contain voice, not noise (muted or gated pauses); "
+                         "noise profile taken from the spectral valley floor")
+        elif excess < -6.0:
+            anchors_reliable = False
+            notes.append("pauses are far quieter than the noise inside speech (gated transfer); "
                          "noise profile taken from the spectral valley floor")
     if not anchors_reliable and valley is not None:
         noise_psd = valley
@@ -262,8 +271,27 @@ def analyze(x: np.ndarray, sr: int, hum_search: bool = True) -> Analysis:
         pause_frames=pause_frames if anchors_reliable else None,
         pause_psds=pause_psds if anchors_reliable else None,
         anchors_reliable=anchors_reliable, noise_measurable=noise_measurable,
-        silent_fraction=silent_fraction, notes=notes,
+        silent_fraction=silent_fraction, decay_db_per_s=decay, offset_frames=offset_frames, notes=notes,
     )
+
+
+def _offsets_and_decay(speech_mask: np.ndarray, e_db: np.ndarray, fps: float,
+                       default_db_per_s: float = 60.0) -> tuple[np.ndarray, float]:
+    """Frame indices where speech ends, and the median decay rate (dB/s)
+    of the in-band level over the first 150-250 ms after clean offsets
+    (>= 0.3 s of speech before, >= 0.25 s without after)."""
+    sp = speech_mask
+    offsets = np.flatnonzero(sp[:-1] & ~sp[1:]) + 1
+    pre, post = int(0.3 * fps), int(0.25 * fps)
+    k150, k250 = max(1, int(0.15 * fps)), max(2, int(0.25 * fps))
+    slopes = []
+    for m in offsets:
+        if m - pre < 0 or m + post >= len(sp) or sp[m - pre:m].mean() < 0.9 or sp[m:m + post].any():
+            continue
+        l0 = e_db[m - 1]
+        slopes.append(max((l0 - e_db[m + k150]) / 0.15, (l0 - e_db[m + k250]) / 0.25))
+    decay = float(np.median(slopes)) if len(slopes) >= 2 else default_db_per_s
+    return offsets, float(np.clip(decay, 8.0, 150.0))
 
 
 def _block_means(power: np.ndarray, live: np.ndarray, blen: int) -> np.ndarray:
@@ -353,6 +381,18 @@ def _band_edges(speech_psd, noise_psd, freqs, sr, margin_db: float = 3.0) -> tup
             break
         i -= 1
     return float(min(high, nyq)), low
+
+
+def _ranges(run_starts, run_ends, st: STFT, n: int, sr: int, min_seconds: float = 0.3) -> list[tuple[int, int]]:
+    """Sample ranges of pauses (runs of noise frames) at least `min_seconds` long."""
+    centre = st.n_fft // 2 - (st.n_fft - st.hop)
+    out: list[tuple[int, int]] = []
+    for s0, e0 in zip(run_starts, run_ends):
+        a = max(0, int(s0) * st.hop + centre)
+        b = min(n, int(e0) * st.hop + centre)
+        if b - a >= min_seconds * sr:
+            out.append((int(a), int(b)))
+    return out
 
 
 def _pauses(run_starts, run_ends, run_acc, st: STFT, n: int, sr: int, min_seconds: float = 0.3):

@@ -38,7 +38,11 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--no-lowpass", dest="lowpass", action="store_false", default=None)
     g.add_argument("--no-tonal-balance", dest="tonal_balance", action="store_false", default=None)
     g.add_argument("--tonal-strength", type=float, dest="tonal_strength", metavar="0..1")
+    g.add_argument("--leveler", dest="leveler", action="store_true", default=None,
+                   help="phrase-level leveler (on in strong/broadcast; slow: 0.6 s attack, 4 s release, +-3 dB)")
     g.add_argument("--no-leveler", dest="leveler", action="store_false", default=None)
+    g.add_argument("--no-tail-preserve", dest="tail_preserve", action="store_false", default=None,
+                   help="let the denoiser cut room decay after phrases at full depth")
     g.add_argument("--lufs", type=float, dest="target_lufs", metavar="LUFS", help="loudness target (default -18)")
     g.add_argument("--no-normalize", dest="no_normalize", action="store_true", help="keep level; only limit true peaks")
     g.add_argument("--true-peak", type=float, dest="true_peak_db", metavar="DBTP", help="ceiling (default -1)")
