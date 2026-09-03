@@ -76,3 +76,24 @@ def test_buzz_line_above_two_kilohertz_and_speed_report(sr):
     assert d["nominal_hz"] == 50.0 and abs(d["speed_error_pct"] - 2.0) < 0.6 and d["line_width_hz"] is not None
     y, applied = hum.remove_hum(noisy, sr, an.hum, pause_ranges=an.pause_ranges)
     assert tone_level_db(noisy, 2550.0, sr) - tone_level_db(y, 2550.0, sr) > 20
+
+
+def test_two_combs_speed_reading_follows_the_mains_line(sr):
+    """Hum recorded on the tape plays back shifted with the transfer speed
+    (50.4 Hz: 0.8 % fast); hum picked up at the transfer sits at the mains
+    frequency (49.96 Hz) and shows in its higher harmonics. The speed
+    reading must follow the mains line itself, and the report says that
+    two combs are present."""
+    v = make_voice(sr, 24.0, f0=140.0)
+    t = np.arange(len(v)) / sr
+    tape = 0.01 * np.sin(2 * np.pi * 50.4 * t) + 0.004 * np.sin(2 * np.pi * 100.8 * t + 1)
+    transfer = 0.004 * np.sin(2 * np.pi * 3 * 49.96 * t + 2) + 0.003 * np.sin(2 * np.pi * 5 * 49.96 * t + 3)
+    noisy = v + tape + transfer + at_snr(v, white(len(v)), 45)
+    an = analysis.analyze(noisy, sr)
+    assert an.hum.detected and abs(an.hum.fundamental_hz - 50.4) < 0.15, an.hum.fundamental_hz
+    d = an.hum.to_dict()
+    assert abs(d["speed_error_pct"] - 0.8) < 0.3, d["speed_error_pct"]
+    assert "two fundamentals" in d["note"] and "49.9" in d["note"], d["note"]
+    y, applied = hum.remove_hum(noisy, sr, an.hum, pause_ranges=an.pause_ranges)
+    for f, drop in ((50.4, 15), (100.8, 15), (149.88, 8), (249.8, 8)):   # the voice's own energy floors the measurement near 150 Hz
+        assert tone_level_db(noisy, f, sr) - tone_level_db(y, f, sr) > drop, f

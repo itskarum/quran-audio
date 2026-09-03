@@ -5,18 +5,21 @@ is to the reference.
 
     python tools/evaluate.py REFERENCE.wav [--snr 14] [--backends classical,dfn]
         [--presets gentle,standard,strong] [--out DIR] [--seconds 60] [--start 5]
-        [--rt60 1.2] [--drr 0] [--no-flutter] [--no-breaths] [--mp3 128]
+        [--rt60 1.0] [--drr 4] [--no-flutter] [--no-breaths] [--mp3 128]
         [--noise-file TRANSFER.wav] [--bandwidth 4500] [--no-eq] [--seed 5]
 
 The reference is the performance as it was in the room: the clean voice
-convolved with a hall (synthetic, RT60 --rt60 s, direct-to-reverberant
-ratio --drr dB), breaths added in its pauses, band-limited to --bandwidth,
-and carrying the transfer's wow and flutter. None of that is the tool's to
+with breaths added in its pauses, convolved with a hall (synthetic, RT60
+--rt60 s, direct-to-reverberant ratio --drr dB: a mosque hall with the
+microphone near the reciter), band-limited to --bandwidth, and carrying
+the transfer's wow and flutter. Slow level drift of +-1 dB (--drift) is
+part of the transfer and stays in the copy: the leveler is off in this
+evaluation, so it bounds SI-SDR on its own. None of that is the tool's to
 remove, so it sits in the reference and counts as fidelity, not as error.
 
 The degradation is the transfer: hiss (pink + white, or noise taken from
 the pauses of a real transfer with --noise-file) at --snr, a 50 Hz mains
-comb that shares the tape's flutter, 400 clicks, +-3 dB slow level drift,
+comb that shares the tape's flutter, 400 clicks, +-1 dB slow level drift,
 and an MP3 round trip at --mp3 kbps (pre-echo, spectral holes); 0 skips it.
 
 Metrics (higher is better unless noted):
@@ -24,12 +27,18 @@ Metrics (higher is better unless noted):
   STOI     short-time objective intelligibility (needs the `eval` extra), 0..1
   coh      mean magnitude-squared coherence with the reference over 150-3500 Hz:
            insensitive to EQ and level, sensitive to noise and speech distortion
-  pause    residual level in the reference's pauses, dBFS (lower is better)
+  pause    level of the error (output minus reference) in the reference's
+           pauses, dBFS: noise left plus damage to the room tail (lower is better)
   clicks   fraction of injected clicks whose error fell by at least 10 dB
-  hum      attenuation of the 50/100/150 Hz lines in the pauses, dB
+  hum      drop of the 50/100/150 Hz line levels in the error signal, dB
   voice    voice-band (300-3000 Hz) level change in speech frames vs the reference, dB
-  tail     extra cut of the room decay 300 ms after phrase ends vs the reference, dB
+  tail     level change of the room decay 300 ms after the dry voice's phrase
+           ends vs the reference, 200 Hz-4 kHz, dB (0 = kept; the degraded copy
+           reads positive because the noise sits on top of the tail)
   breath   level change of the inserted breaths vs the reference, dB (0 = kept)
+
+The header line also gives the SI-SDR of the MP3 round trip alone, the
+ceiling no restoration can pass while the MP3 error stays in the copy.
 """
 from __future__ import annotations
 
@@ -100,7 +109,7 @@ def add_room(x: np.ndarray, sr: int, rt60: float, drr_db: float, rng) -> np.ndar
 # ----- breaths ----------------------------------------------------------
 def add_breaths(x: np.ndarray, sr: int, pauses: list[tuple[int, int]], rng, level_db: float = -30.0) -> tuple[np.ndarray, list[tuple[int, int]]]:
     """A 250-400 ms inhalation (500 Hz-4 kHz noise, quick rise, slower
-    fall) in every pause longer than 0.7 s, `level_db` below the speech
+    fall) in every gap longer than 0.6 s, `level_db` below the speech
     RMS. Returns the signal and the breath sample ranges."""
     y = x.copy()
     levels = fidelity_levels(x, sr)
@@ -108,11 +117,11 @@ def add_breaths(x: np.ndarray, sr: int, pauses: list[tuple[int, int]], rng, leve
     sos = butter(4, [500.0, min(4000.0, 0.45 * sr)], btype="band", fs=sr, output="sos")
     out = []
     for p0, p1 in pauses:
-        if (p1 - p0) / sr < 0.7:
+        if (p1 - p0) / sr < 0.6:
             continue
         dur = rng.uniform(0.25, 0.4)
-        a = p0 + int(0.15 * sr)
-        b = min(a + int(dur * sr), p1 - int(0.1 * sr))
+        a = p0 + int(0.1 * sr)
+        b = min(a + int(dur * sr), p1 - int(0.05 * sr))
         if b - a < int(0.2 * sr):
             continue
         n = b - a
@@ -210,13 +219,13 @@ def mp3_round_trip(x: np.ndarray, sr: int, kbps: int) -> np.ndarray:
 
 def degrade(clean: np.ndarray, sr: int, args, rng) -> dict:
     clean = clean / (np.max(np.abs(clean)) + 1e-12) * 0.5
-    room = add_room(clean, sr, args.rt60, args.drr, rng)
     if args.bandwidth > 0:
-        room = sosfiltfilt(butter(6, min(args.bandwidth, 0.45 * sr), fs=sr, output="sos"), room)
-    pauses = analysis.analyze(room, sr, hum_search=False).pause_ranges
+        clean = sosfiltfilt(butter(6, min(args.bandwidth, 0.45 * sr), fs=sr, output="sos"), clean)
+    gaps, offsets = dry_gaps(clean, sr)
     breaths: list[tuple[int, int]] = []
     if not args.no_breaths:
-        room, breaths = add_breaths(room, sr, pauses, rng)
+        clean, breaths = add_breaths(clean, sr, gaps, rng)
+    room = add_room(clean, sr, args.rt60, args.drr, rng)
     t = np.arange(len(room)) / sr
     hum = 0.01 * np.sin(2 * np.pi * 50 * t) + 0.004 * np.sin(2 * np.pi * 100 * t + 1) + 0.003 * np.sin(2 * np.pi * 150 * t + 2)
     if args.no_flutter:
@@ -230,29 +239,80 @@ def degrade(clean: np.ndarray, sr: int, args, rng) -> dict:
     pos = rng.integers(1000, len(ref) - 1000, 400)
     for p in pos:
         clicks[p:p + rng.integers(1, 6)] += rng.uniform(0.05, 0.4) * rng.choice([-1, 1])
-    drift = 10 ** (np.sin(2 * np.pi * 0.02 * t) * 3 / 20)
+    drift = 10 ** (np.sin(2 * np.pi * 0.02 * t) * args.drift / 20)
     degraded = (taped + noise + hum * 0 + clicks) * drift
     scale = 0.5 / np.max(np.abs(degraded))
     ref, degraded = ref * scale, degraded * scale
+    mp3_ceiling = None
     if args.mp3 > 0:
         degraded = mp3_round_trip(degraded, sr, args.mp3)
+        mp3_ceiling = si_sdr(ref, mp3_round_trip(ref, sr, args.mp3))
     ref_pauses = analysis.analyze(ref, sr, hum_search=False).pause_ranges
-    return {"ref": ref, "degraded": degraded, "clicks": pos, "breaths": breaths, "pauses": ref_pauses}
+    return {"ref": ref, "degraded": degraded, "clicks": pos, "breaths": breaths, "pauses": ref_pauses,
+            "offsets": offsets, "mp3_ceiling": mp3_ceiling}
+
+
+def dry_gaps(x: np.ndarray, sr: int) -> tuple[list[tuple[int, int]], list[int]]:
+    """Gaps and phrase ends of the dry voice, from 50 ms frame levels
+    relative to the speech level (the 90th percentile): a gap is at least
+    0.5 s more than 25 dB down; a phrase end has 0.5 s of speech before it
+    and 0.4 s of gap after it."""
+    n = int(0.05 * sr)
+    frames = x[: len(x) // n * n].reshape(-1, n)
+    lv = 10 * np.log10(np.mean(frames ** 2, axis=1) + 1e-20)
+    quiet = lv < float(np.percentile(lv, 90)) - 25.0
+    gaps = []
+    i = 0
+    while i < len(quiet):
+        if not quiet[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(quiet) and quiet[j]:
+            j += 1
+        if j - i >= 10:
+            gaps.append((i * n, j * n))
+        i = j
+    speech = ~quiet
+    offsets = [i * n for i in range(10, len(speech) - 8)
+               if speech[i - 1] and not speech[i] and speech[i - 10:i].mean() > 0.8 and not speech[i:i + 8].any()]
+    return gaps, offsets
 
 
 # ----- metrics ----------------------------------------------------------
-def hum_prominence_db(x: np.ndarray, sr: int, pz: np.ndarray) -> float:
-    """Mean prominence of the 50/100/150 Hz lines over the pause samples."""
-    seg = x[pz]
-    if len(seg) < 4 * sr:
+def hum_level_db(err: np.ndarray, sr: int) -> float:
+    """Mean level of the 50/100/150 Hz lines in the error signal (peak PSD
+    within +-1 Hz, dB)."""
+    if len(err) < 4 * sr:
         return float("nan")
-    f, p = welch(seg, fs=sr, nperseg=4 * sr, noverlap=2 * sr)
+    f, p = welch(err, fs=sr, nperseg=4 * sr, noverlap=2 * sr)
+    return float(np.mean([10 * np.log10(max(p[(f >= h - 1.0) & (f <= h + 1.0)].max(), 1e-30)) for h in HUM_HZ]))
+
+
+def hum_prominence_db(err: np.ndarray, sr: int) -> float:
+    """Mean prominence of the 50/100/150 Hz lines over the noise around them."""
+    if len(err) < 4 * sr:
+        return float("nan")
+    f, p = welch(err, fs=sr, nperseg=4 * sr, noverlap=2 * sr)
     vals = []
     for h in HUM_HZ:
         line = p[(f >= h - 1.0) & (f <= h + 1.0)].max()
         around = np.median(p[(f >= h - 12.0) & (f <= h + 12.0) & ((f < h - 2.0) | (f > h + 2.0))])
         vals.append(10 * np.log10(line / max(around, 1e-30)))
     return float(np.mean(vals))
+
+
+def tail_change_db(ref_mid: np.ndarray, y_mid: np.ndarray, sr: int, offsets: list[int]) -> float | None:
+    """Level of `y` against `ref` (both 200 Hz-4 kHz) in the 100 ms around
+    300 ms after each dry phrase end."""
+    vals = []
+    for o in offsets:
+        a, b = o + int(0.25 * sr), o + int(0.35 * sr)
+        if b > len(ref_mid):
+            continue
+        e_ref, e_y = np.mean(ref_mid[a:b] ** 2), np.mean(y_mid[a:b] ** 2)
+        vals.append(10 * np.log10(max(e_y, 1e-30) / max(e_ref, 1e-30)))
+    return round(float(np.median(vals)), 2) if len(vals) >= 3 else None
 
 
 def breath_change_db(ref: np.ndarray, y: np.ndarray, sr: int, breaths: list[tuple[int, int]], pauses: list[tuple[int, int]]) -> float | None:
@@ -281,13 +341,14 @@ def main() -> int:
     ap.add_argument("--presets", default="gentle,standard,strong")
     ap.add_argument("--out", help="directory for reference/degraded/restored files and results.json")
     ap.add_argument("--no-eq", action="store_true", help="disable high-pass, low-pass and tonal balance")
-    ap.add_argument("--rt60", type=float, default=1.2, help="hall reverberation time in s (0 = dry)")
-    ap.add_argument("--drr", type=float, default=0.0, help="direct-to-reverberant ratio in dB")
+    ap.add_argument("--rt60", type=float, default=1.0, help="hall reverberation time in s (0 = dry)")
+    ap.add_argument("--drr", type=float, default=4.0, help="direct-to-reverberant ratio in dB")
     ap.add_argument("--no-flutter", action="store_true", help="steady transfer speed")
     ap.add_argument("--no-breaths", action="store_true", help="no inhalations in the pauses")
     ap.add_argument("--mp3", type=int, default=128, help="MP3 round trip at this bitrate (0 = none)")
     ap.add_argument("--noise-file", help="a real transfer: its pauses supply the hiss instead of synthetic noise")
     ap.add_argument("--bandwidth", type=float, default=4500.0, help="band-limit of the reference in Hz (0 = full)")
+    ap.add_argument("--drift", type=float, default=1.0, help="slow level drift of the transfer, +- dB (0 = none)")
     ap.add_argument("--seed", type=int, default=5)
     args = ap.parse_args()
     rng = np.random.default_rng(args.seed)
@@ -300,7 +361,10 @@ def main() -> int:
     d = degrade(clean, sr, args, rng)
     ref, degraded, click_pos, breaths, pauses = d["ref"], d["degraded"], d["clicks"], d["breaths"], d["pauses"]
     pz = np.concatenate([np.arange(s, e) for s, e in pauses]) if pauses else np.arange(0, sr)
-    hum_before = hum_prominence_db(degraded, sr, pz)
+    hum_before = hum_prominence_db(degraded - ref, sr)
+    hum_level_before = hum_level_db(degraded - ref, sr)
+    mid_sos = butter(4, [200.0, min(4000.0, 0.45 * sr)], btype="band", fs=sr, output="sos")
+    ref_mid = sosfiltfilt(mid_sos, ref)
     try:
         from pystoi import stoi
     except ImportError:
@@ -315,13 +379,14 @@ def main() -> int:
         err_b = np.array([np.max(np.abs((degraded - ref)[p:p + 8])) for p in click_pos])
         err_a = np.array([np.max(np.abs((y - ref)[p:p + 8])) for p in click_pos])
         fid = fidelity.measure(ref, y, sr)
+        err = y - ref
         m = {"si_sdr_db": round(si_sdr(ref, y), 2), "coherence": round(band_coherence(y), 3),
-             "pause_dbfs": round(float(20 * np.log10(np.std(y[pz]) + 1e-12)), 1),
+             "pause_dbfs": round(float(20 * np.log10(np.std(err[pz]) + 1e-12)), 1),
              "clicks_fixed": round(float(np.mean(err_a < err_b * 10 ** (-10 / 20))), 2),
-             "hum_attenuation_db": round(hum_before - hum_prominence_db(y, sr, pz), 1),
+             "hum_attenuation_db": round(hum_level_before - hum_level_db(err, sr), 1),
              "voice_band_db": fid["voice_band_retention_db"],
              "onset_db": fid["onset_retention_db"],
-             "tail_db": None if not fid["tail_300ms_db"] else fid["tail_300ms_db"]["extra_cut"],
+             "tail_db": tail_change_db(ref_mid, sosfiltfilt(mid_sos, y), sr, d["offsets"]),
              "breath_db": breath_change_db(ref, y, sr, breaths, pauses)}
         if stoi is not None:
             m["stoi"] = round(float(stoi(ref, y, sr)), 3)
@@ -329,7 +394,8 @@ def main() -> int:
 
     degradation = {"snr_db": args.snr, "rt60_s": args.rt60, "drr_db": args.drr, "flutter": not args.no_flutter,
                    "breaths": len(breaths), "mp3_kbps": args.mp3, "noise": args.noise_file or "pink+white",
-                   "bandwidth_hz": args.bandwidth, "clicks": int(len(click_pos)), "seed": args.seed}
+                   "bandwidth_hz": args.bandwidth, "clicks": int(len(click_pos)), "seed": args.seed,
+                   "phrase_ends": len(d["offsets"]), "mp3_si_sdr_ceiling_db": None if d["mp3_ceiling"] is None else round(d["mp3_ceiling"], 2)}
     results = {"reference": str(args.reference), "sample_rate": sr, "seconds": len(ref) / sr,
                "degradation": degradation, "degraded": metrics(degraded), "runs": []}
     if args.out:
@@ -337,10 +403,11 @@ def main() -> int:
         out.mkdir(parents=True, exist_ok=True)
         audio_io.save(out / "reference.wav", ref, sr)
         audio_io.save(out / "degraded.wav", degraded, sr)
+    ceiling = "" if d["mp3_ceiling"] is None else f" (the MP3 round trip alone caps SI-SDR at {d['mp3_ceiling']:.1f} dB)"
     print(f"reference {args.reference}: {len(ref)/sr:.0f} s at {sr} Hz; room RT60 {args.rt60} s at DRR {args.drr} dB, "
-          f"{len(breaths)} breaths, flutter {'off' if args.no_flutter else 'on'}; transfer: {degradation['noise']} hiss at "
-          f"{args.snr} dB SNR, 50 Hz comb ({hum_before:.0f} dB above the hiss), {len(click_pos)} clicks, drift, "
-          f"MP3 {args.mp3 or 'none'} kbps")
+          f"{len(breaths)} breaths, {len(d['offsets'])} phrase ends, flutter {'off' if args.no_flutter else 'on'}; "
+          f"transfer: {Path(degradation['noise']).name} hiss at {args.snr} dB SNR, 50 Hz comb ({hum_before:.0f} dB over "
+          f"the hiss), {len(click_pos)} clicks, drift, MP3 {args.mp3 or 'none'} kbps{ceiling}")
     cols = f"{'run':24s} {'SI-SDR':>7s} {'STOI':>6s} {'coh':>6s} {'pause':>7s} {'clicks':>6s} {'hum':>6s} {'voice':>6s} {'tail':>6s} {'breath':>6s} {'time':>6s}"
     print(cols)
 

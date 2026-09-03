@@ -138,16 +138,21 @@ def integrated_loudness(x: np.ndarray, sr: int) -> float:
     """BS.1770-4 integrated loudness in LUFS (gated), at the native rate.
     -inf for silence."""
     x2 = _as_2d(np.asarray(x, dtype=np.float64))
-    chans = [k_weight(x2[:, c], sr) for c in range(x2.shape[1])]
     block, hop = int(round(0.4 * sr)), int(round(0.1 * sr))
-    n = len(chans[0])
-    if n < block:
-        chans = [np.concatenate([c, np.zeros(block - n)]) for c in chans]
-    starts = np.arange(0, len(chans[0]) - block + 1, hop)
+    n = max(x2.shape[0], block)
+    starts = np.arange(0, n - block + 1, hop)
     ms = np.zeros(len(starts))
-    for c in chans:
-        cs = np.concatenate([[0.0], np.cumsum(c * c)])
-        ms += (cs[starts + block] - cs[starts]) / block
+    for c in range(x2.shape[1]):
+        # one channel at a time, squared in place, summed by cumulative sum:
+        # two full-length temporaries instead of one per channel and step
+        k = k_weight(x2[:, c], sr)
+        if len(k) < block:
+            k = np.concatenate([k, np.zeros(block - len(k))])
+        np.square(k, out=k)
+        cs = np.cumsum(k)
+        del k
+        ms += (cs[starts + block - 1] - np.where(starts > 0, cs[np.maximum(starts - 1, 0)], 0.0)) / block
+        del cs
     lk = -0.691 + 10.0 * np.log10(ms + 1e-20)
     abs_gate = lk > -70.0
     if not abs_gate.any():
@@ -195,16 +200,23 @@ def limiter(x: np.ndarray, sr: int, ceiling_db: float = -1.0, lookahead_ms: floa
     x2 = _as_2d(np.asarray(x, dtype=np.float64))
     n = x2.shape[0]
     ceiling = 10 ** (ceiling_db / 20.0)
+    # one true-peak pass; the gain it asks for is built from it in place
     tp = _true_peak_envelope(x2)
-    g_req = np.minimum(1.0, ceiling / np.maximum(tp, 1e-12))
-    if g_req.min() >= 1.0:
+    tp_max = float(tp.max())
+    if tp_max <= ceiling:
         return x, {"applied": False, "max_reduction_db": 0.0,
-                   "true_peak_after_dbtp": round(float(20 * np.log10(max(float(tp.max()), 1e-12))), 2)}
+                   "true_peak_after_dbtp": round(float(20 * np.log10(max(tp_max, 1e-12))), 2)}
+    g = np.maximum(tp, 1e-12)
+    np.divide(ceiling, g, out=g)
+    np.minimum(g, 1.0, out=g)
     la = max(1, int(lookahead_ms * 1e-3 * sr))
     # look-ahead minimum: h[i] = min(g_req[i : i + 2 la])
-    padded = np.concatenate([g_req, np.ones(la)])
-    h = minimum_filter1d(padded, size=2 * la, mode="constant", cval=1.0)[la:la + n]
-    # exponential release at a 1 ms control rate
+    h = np.empty(n + la)
+    h[:n] = g
+    h[n:] = 1.0
+    del g
+    h = minimum_filter1d(h, size=2 * la, mode="constant", cval=1.0)[la:la + n]
+    # exponential release at a 1 ms control rate, on the control-rate minima
     ctrl = max(1, int(0.001 * sr))
     m = -(-n // ctrl)
     hp = np.concatenate([h, np.ones(m * ctrl - n)]).reshape(m, ctrl).min(axis=1)
@@ -214,19 +226,38 @@ def limiter(x: np.ndarray, sr: int, ceiling_db: float = -1.0, lookahead_ms: floa
     for i in range(m):
         prev = min(hp[i], prev + (1.0 - prev) * r)
         gc[i] = prev
-    g = np.interp(np.arange(n), np.arange(m) * ctrl + ctrl / 2.0, gc)
-    g = np.minimum(g, h)
+    del hp
+    # back to the sample rate in chunks (np.interp over the whole signal would
+    # need two more full-length temporaries), min with the look-ahead floor
+    centres = np.arange(m) * ctrl + ctrl / 2.0
+    chunk = 1 << 20
+    for s0 in range(0, n, chunk):
+        e0 = min(n, s0 + chunk)
+        h[s0:e0] = np.minimum(h[s0:e0], np.interp(np.arange(s0, e0), centres, gc))
+    del gc, centres
     # causal moving average over la samples: the attack ramp
-    v = np.concatenate([np.ones(la), g])
-    cs = np.concatenate([[0.0], np.cumsum(v)])
-    g_final = (cs[la + 1:la + 1 + n] - cs[1:1 + n]) / la
+    cs = np.empty(n + la + 1)
+    cs[0] = 0.0
+    cs[1:la + 1] = np.arange(1, la + 1)
+    np.cumsum(h, out=cs[la + 1:])
+    cs[la + 1:] += la
+    g_final = h                                   # reuse the buffer
+    np.subtract(cs[la + 1:la + 1 + n], cs[1:1 + n], out=g_final)
+    g_final /= la
+    del cs
     y = x2 * g_final[:, None]
-    over = int(np.count_nonzero(np.abs(y) > ceiling * 1.001))
+    over = 0
+    tp_after = 0.0
+    for s0 in range(0, n, chunk):
+        e0 = min(n, s0 + chunk)
+        over += int(np.count_nonzero(np.abs(y[s0:e0]) > ceiling * 1.001))
+        tp_after = max(tp_after, float(np.max(tp[s0:e0] * g_final[s0:e0])))
+    del tp
     if x.ndim == 1:
         y = y[:, 0]
     return y, {"applied": True, "max_reduction_db": round(float(20 * np.log10(g_final.min())), 2),
                "samples_over_ceiling": over,
-               "true_peak_after_dbtp": round(float(20 * np.log10(max(float(np.max(tp * g_final)), 1e-12))), 2)}
+               "true_peak_after_dbtp": round(float(20 * np.log10(max(tp_after, 1e-12))), 2)}
 
 
 def normalize_loudness(x: np.ndarray, sr: int, target_lufs: float = -18.0, ceiling_db: float = -1.0,

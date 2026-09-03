@@ -562,14 +562,21 @@ def detect_hum(x: np.ndarray, sr: int, pause_ranges: list[tuple[int, int]] | Non
         if score > best_score:
             best_f0, best_score = float(f0), score
 
-    # refine f0 from the measured harmonic peaks, then measure every harmonic
+    # refine f0 from the mains line and its second harmonic when they are
+    # measurable (the lines that define the fundamental; higher lines may
+    # belong to another source, see the note below), else from the first four
     est, weights = [], []
     for k in range(1, 5):
         fpk, prom = _prominence(freqs, psd, k * best_f0, tol)
         if prom >= min_prominence_db:
-            est.append(fpk / k)
-            weights.append(prom)
-    f0 = float(np.average(est, weights=weights)) if est else best_f0
+            est.append((k, fpk / k, prom))
+    low = [(f, w) for k, f, w in est if k <= 2]
+    if low:
+        f0 = float(np.average([f for f, _ in low], weights=[w for _, w in low]))
+    elif est:
+        f0 = float(np.average([f for _, f, _ in est], weights=[w for _, _, w in est]))
+    else:
+        f0 = best_f0
 
     # Confirmation material: hum is there whether or not anyone is speaking,
     # a sustained voice harmonic is not. With enough pause material every
@@ -588,6 +595,13 @@ def detect_hum(x: np.ndarray, sr: int, pause_ranges: list[tuple[int, int]] | Non
             pf, pp, _ = pause_psd
             ptol = max(3.0, 2.5 * (pf[1] - pf[0]))
             ppk, pprom = _prominence(pf, pp, target, ptol)
+            if pprom < need:
+                # a line from a second hum source (see the note below) drifts
+                # away from k * f0 as k grows: look 1.5 % of the target wide
+                # (12 Hz at most), and ask 8 dB of a line found only there
+                ppk2, pprom2 = _prominence(pf, pp, target, max(ptol, min(12.0, 0.015 * target)))
+                if pprom2 >= max(need, 8.0):
+                    ppk, pprom = ppk2, pprom2
             if pprom >= need:
                 if not whole_ok:
                     # masked by the voice in the whole-file spectrum: locate the
@@ -610,6 +624,25 @@ def detect_hum(x: np.ndarray, sr: int, pause_ranges: list[tuple[int, int]] | Non
         detected = p1 >= 12.0 and (len(harmonics) >= 2 or p1 >= 18.0)
     if not detected:
         note = "no stationary comb above threshold"
+    elif len(harmonics) >= 3:
+        # an old transfer often carries two combs: the hum recorded on the
+        # tape (shifted with the transfer speed) and hum picked up at the
+        # transfer, at the mains frequency exactly. Each line is treated at
+        # its own frequency either way; only the speed reading needs the note.
+        implied = [(h.freq_hz / max(1, int(round(h.freq_hz / f0))), h.prominence_db) for h in harmonics]
+        others = [(f, w) for f, w in implied if abs(f / f0 - 1.0) > 0.003]
+        if len(others) >= 2:
+            # do the stray lines agree on a fundamental of their own?
+            fs = np.array([f for f, _ in others])
+            ws = np.array([w for _, w in others])
+            agree = np.abs(fs / np.median(fs) - 1.0) <= 0.003
+            if agree.sum() >= 2:
+                f_other = float(np.average(fs[agree], weights=ws[agree]))
+                note += (f"; lines fit two fundamentals, {f0:.2f} Hz (mains line, used for the speed reading) "
+                         f"and {f_other:.2f} Hz: hum on the tape and hum from the transfer")
+            else:
+                note += (f"; lines above the second harmonic do not fit the {f0:.2f} Hz comb: "
+                         "more than one hum source, each line is treated at its own frequency")
     return HumReport(detected, f0 if detected else 0.0, harmonics if detected else [], note)
 
 

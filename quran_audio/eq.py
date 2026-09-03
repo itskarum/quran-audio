@@ -5,7 +5,7 @@ spectrum. Every filter is zero-phase, so the output stays sample-aligned.
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import butter, fftconvolve, firwin2, sosfiltfilt
+from scipy.signal import butter, firwin2, oaconvolve, sosfiltfilt
 
 
 def highpass(x: np.ndarray, sr: int, fc: float, order: int = 2) -> np.ndarray:
@@ -161,5 +161,6 @@ def design_tonal_balance(speech_psd: np.ndarray, freqs: np.ndarray, sr: int, low
 
 
 def apply_fir(x: np.ndarray, taps: np.ndarray) -> np.ndarray:
-    """Zero-delay application of an odd-length linear-phase FIR."""
-    return fftconvolve(x, taps, mode="same")
+    """Zero-delay application of an odd-length linear-phase FIR. Overlap-add
+    (block FFTs), so an hour-long file never needs a full-length FFT."""
+    return oaconvolve(x, taps, mode="same")

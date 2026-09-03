@@ -1,11 +1,21 @@
 """Broadband noise reduction in the STFT domain: classical, non-generative.
 
 Gain rule: the MMSE log-spectral-amplitude estimator (Ephraim & Malah,
-1985) fused with a speech-presence probability in the "optimally
-modified" form of Cohen (2002):  G = G_LSA^p * G_min^(1-p).
+1985), with the two-step a priori SNR of Plapous, Marro and Scalart
+(2006) so onsets are not lagged, combined with a speech-presence
+probability in the form G = G_LSA^p * G_min^(1-p). That form is Cohen's
+(2002) "optimally modified" LSA, but the probability is not Cohen's:
+p is the fixed-prior presence probability of Gerkmann & Hendriks
+(P(H1) = 0.5, xi_H1 = 15 dB), smoothed over +-2 bins and square-rooted
+(the default "soft" fusion; "spp" uses it unrooted, "xi" uses Cohen's
+estimator from the tracked a priori SNR, "none" uses the LSA gain alone).
 Noise PSD: the unbiased MMSE tracker of Gerkmann & Hendriks (2012),
-initialised from the pause spectrum measured during analysis so it does
-not have to learn the noise from scratch. A priori SNR: decision-directed.
+anchored to the pause spectra measured during analysis (it may drift
+-6/+3 dB around them) so a long held note is never learned as noise.
+Two protections keep the voice intact: a pitch-tracked harmonic ladder
+whose bins are never taken below protect_db, and a tail window after each
+phrase in which bins still above the noise keep the spectral-subtraction
+gain, so room decay fades into the residual instead of being gated.
 
 Why this and not spectral subtraction: the LSA estimator minimises the
 error of the *log* amplitude, which is what the ear judges, and it
