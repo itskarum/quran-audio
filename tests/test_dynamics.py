@@ -68,3 +68,28 @@ def test_leveler_is_phrase_level():
     assert abs(g[i_step + 10] - g[i_step]) < 0.6              # nothing happens inside the first 100 ms
     assert g[i_step + 150] - g[i_step - 60] > 1.0             # but the quiet phrase is lifted within 1.5 s
     assert np.std(g[60:170]) < 0.4 and np.std(g[640:760]) < 0.4   # syllables are not chased
+
+
+def test_k_weighting_matches_the_standard_table():
+    pre_b, pre_a, rlb_b, rlb_a = dynamics.k_weighting_coefficients(48000)
+    assert np.allclose(pre_b, dynamics._PRE_B, atol=1e-6) and np.allclose(pre_a, dynamics._PRE_A, atol=1e-6)
+    assert np.allclose(rlb_b, dynamics._RLB_B, atol=1e-6) and np.allclose(rlb_a, dynamics._RLB_A, atol=1e-6)
+
+
+def test_loudness_native_rate_reference_tone():
+    """A 997 Hz sine at -20 dBFS peak reads -23.0 LUFS in one channel, at
+    any sample rate."""
+    for sr in (44100, 22050, 96000):
+        t = np.arange(int(10 * sr)) / sr
+        x = 10 ** (-20 / 20) * np.sin(2 * np.pi * 997 * t)
+        assert abs(dynamics.integrated_loudness(x, sr) - (-23.01)) < 0.15, sr
+
+
+def test_frame_rms_running_sum_matches_direct():
+    rng = np.random.default_rng(3)
+    x = rng.standard_normal(20000) * np.linspace(0.1, 1.0, 20000)
+    sr = 8000
+    centres, levels = dynamics.frame_rms_db(x, sr, win_s=0.05, hop_s=0.01)
+    win, hop = int(0.05 * sr), int(0.01 * sr)
+    direct = [10 * np.log10(np.mean(x[i:i + win] ** 2)) for i in range(0, len(x) - win + 1, hop)]
+    assert np.allclose(levels, direct, atol=1e-6) and len(centres) == len(direct)

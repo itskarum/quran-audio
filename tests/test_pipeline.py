@@ -90,3 +90,17 @@ def test_silent_and_tiny_inputs():
     r2 = enhance_signal(tiny, sr, make_settings("strong", {"denoise": "classical", "residual": True}))
     assert r2.samples.shape == (len(tiny), 1) and r2.residual.shape == (len(tiny), 1)
     assert np.all(np.isfinite(r2.samples)) and r2.report["length_preserved"]
+
+
+def test_speed_correction_is_opt_in_and_reported(sr):
+    from conftest import make_voice, at_snr, white
+    v = make_voice(sr, 24.0)
+    t = np.arange(len(v)) / sr
+    noisy = v + 0.01 * np.sin(2 * np.pi * 51.0 * t) + 0.004 * np.sin(2 * np.pi * 102.0 * t) + at_snr(v, white(len(v)), 40)
+    plain = enhance_signal(noisy, sr, make_settings("gentle", {"target_lufs": None, "denoise": "off"}))
+    assert plain.report["speed_correction"] is None and plain.samples.shape[0] == len(noisy)
+    fixed = enhance_signal(noisy, sr, make_settings("gentle", {"target_lufs": None, "denoise": "off", "speed_correct": True}))
+    rep = fixed.report["speed_correction"]
+    assert rep["applied"] and abs(rep["speed_error_pct"] - 2.0) < 0.6
+    assert abs(fixed.samples.shape[0] / len(noisy) - 1.02) < 0.005      # ran 2 % fast: slowed down, so longer
+    assert not fixed.report["length_preserved"]

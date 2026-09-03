@@ -43,6 +43,8 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--leveler", dest="leveler", action="store_true", default=None,
                    help="phrase-level leveler (on in strong/broadcast; slow: 0.6 s attack, 4 s release, +-3 dB)")
     g.add_argument("--no-leveler", dest="leveler", action="store_false", default=None)
+    g.add_argument("--speed-correct", dest="speed_correct", action="store_true", default=None,
+                   help="resample so the mains line sits at 50/60 Hz exactly (changes pitch, tempo and length: opt-in)")
     g.add_argument("--no-tail-preserve", dest="tail_preserve", action="store_false", default=None,
                    help="let the denoiser cut room decay after phrases at full depth")
     g.add_argument("--lufs", type=float, dest="target_lufs", metavar="LUFS", help="loudness target (default -18)")
@@ -57,7 +59,7 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
 
 def _settings_from_args(args: argparse.Namespace):
     keys = ["denoise", "denoise_floor_db", "dfn_atten_lim_db", "dfn_model", "hum", "declick", "decrackle",
-            "declip", "highpass", "lowpass", "tonal_balance", "tonal_strength", "tonal_reference", "leveler", "target_lufs",
+            "declip", "highpass", "lowpass", "tonal_balance", "tonal_strength", "tonal_reference", "leveler", "target_lufs", "speed_correct",
             "true_peak_db", "output_sr", "channels", "mono_strategy", "output_subtype"]
     overrides = {k: getattr(args, k) for k in keys if getattr(args, k, None) is not None}
     if getattr(args, "no_normalize", False):
@@ -117,6 +119,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     if hum["detected"]:
         harm = ", ".join(f"{h['freq_hz']:.1f} Hz ({h['prominence_db']:.0f} dB)" for h in hum["harmonics"])
         print(f"  hum at {hum['fundamental_hz']:.2f} Hz: {harm} [{hum['note']}]")
+        if hum.get("speed_error_pct") is not None:
+            print(f"  transfer speed from the mains line: {hum['speed_error_pct']:+.3f} % "
+                  f"(line width {hum['line_width_hz']} Hz; a stable transfer shows ~0.4 Hz)")
     else:
         print(f"  no hum ({hum['note']})")
     return 0

@@ -30,7 +30,7 @@ from .analysis import Analysis, analyze, speech_spectrum
 from .audio_io import fit_length, load, remove_dc, resample, resampled_length, save, to_mono
 from .declick import declick, declip
 from .denoise import DenoiseSettings, denoise, denoise_linked
-from .dynamics import integrated_loudness, limiter, leveler_gain, normalize_loudness, true_peak_dbtp
+from .dynamics import integrated_loudness, limiter, leveler_gain, normalize_loudness
 from .eq import apply_fir, design_tonal_balance, highpass, lowpass, rumble_cutoff
 from .hum import remove_hum
 
@@ -79,6 +79,7 @@ class Settings:
     target_lufs: float | None = -18.0    # None = no loudness normalisation
     true_peak_db: float = -1.0
     residual: bool = False
+    speed_correct: bool = False          # opt-in: resample so the mains line sits at 50/60 Hz exactly
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -279,6 +280,27 @@ def _process_group(chans: list[np.ndarray], sr: int, settings: Settings, backend
     return pres, xs, reps, an
 
 
+def _speed_correct(x: np.ndarray, sr: int, max_error_pct: float = 5.0) -> tuple[np.ndarray, dict | None]:
+    """Resample (n, ch) so the detected mains line lands on its nominal
+    frequency. A transfer that ran 2 % slow has every madd 2 % longer and
+    every note 2 % flat; the hum is the pilot tone that reveals it."""
+    from .analysis import detect_hum
+    mono = to_mono(x, "auto", sr)[0]
+    hum = detect_hum(mono - mono.mean(), sr, None)
+    err = hum.speed_error_pct
+    if err is None:
+        return x, {"applied": False, "note": "no mains line detected; speed left as is"}
+    if abs(err) > max_error_pct:
+        return x, {"applied": False, "note": f"implied speed error {err:+.2f} % exceeds {max_error_pct} %; left as is"}
+    if abs(err) < 0.02:
+        return x, {"applied": False, "note": f"speed error {err:+.3f} % is within the analysis resolution; left as is"}
+    sr_eff = int(round(sr * hum.nominal_hz / hum.fundamental_hz))
+    y = np.stack([resample(x[:, c], sr_eff, sr) for c in range(x.shape[1])], axis=1)
+    return y, {"applied": True, "hum_hz": round(hum.fundamental_hz, 3), "nominal_hz": hum.nominal_hz,
+               "speed_error_pct": round(err, 3), "samples_before": int(x.shape[0]), "samples_after": int(y.shape[0]),
+               "note": f"mains line at {hum.fundamental_hz:.3f} Hz: transfer ran {err:+.2f} %; resampled to correct"}
+
+
 def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = None,
                    log: Log | None = None) -> Result:
     """Restore `samples` (1-D, or (n, channels)) at sample rate `sr`."""
@@ -288,6 +310,12 @@ def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = Non
     if x.ndim == 1:
         x = x[:, None]
     n_in, ch_in = x.shape
+    speed_rep = None
+    if settings.speed_correct:
+        x, speed_rep = timer.run("speed", lambda: _speed_correct(x, sr))
+        if log and speed_rep:
+            log(f"speed: {speed_rep['note']}")
+    n_work = x.shape[0]
     stereo_rep = None
     if settings.channels == "mono":
         mono, strategy, stereo_rep = to_mono(x, settings.mono_strategy, sr)
@@ -321,11 +349,11 @@ def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = Non
     else:
         y, lim = timer.run("loudness", lambda: limiter(y, sr, settings.true_peak_db))
         loud = {"loudness_after_lufs": integrated_loudness(y, sr), "limiter": lim,
-                "true_peak_after_dbtp": round(true_peak_dbtp(y), 2)}
+                "true_peak_after_dbtp": lim["true_peak_after_dbtp"]}
 
     out_sr = settings.output_sr or sr
     if out_sr != sr:
-        n_out = resampled_length(n_in, sr, out_sr)
+        n_out = resampled_length(n_work, sr, out_sr)
         y = np.stack([fit_length(resample(y[:, c], sr, out_sr), n_out) for c in range(y.shape[1])], axis=1)
         if residual is not None:
             residual = np.stack([fit_length(resample(residual[:, c], sr, out_sr), n_out) for c in range(residual.shape[1])], axis=1)
@@ -346,7 +374,8 @@ def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = Non
         "output": {"sample_rate": out_sr, "channels": int(y.shape[1]), "samples": int(y.shape[0]),
                    "duration_s": round(y.shape[0] / out_sr, 3), "peak_dbfs": round(float(20 * np.log10(np.max(np.abs(y)) + 1e-12)), 2)},
         "timing_s": timer.timings,
-        "length_preserved": int(y.shape[0]) == resampled_length(n_in, sr, out_sr),
+        "speed_correction": speed_rep,
+        "length_preserved": int(y.shape[0]) == resampled_length(n_work, sr, out_sr) and speed_rep is None,
     }
     return Result(y, out_sr, residual, report)
 

@@ -32,10 +32,34 @@ class HumReport:
     harmonics: list[HumHarmonic]
     note: str = ""
 
+    @property
+    def nominal_hz(self) -> float:
+        return 50.0 if abs(self.fundamental_hz - 50.0) <= abs(self.fundamental_hz - 60.0) else 60.0
+
+    @property
+    def speed_error_pct(self) -> float | None:
+        """Transfer speed error implied by the mains line: positive means the
+        recording plays fast (pitch and tempo high)."""
+        if not self.detected or self.fundamental_hz <= 0:
+            return None
+        return (self.fundamental_hz / self.nominal_hz - 1.0) * 100.0
+
+    @property
+    def line_width_hz(self) -> float | None:
+        """Width of the fundamental: a wow/flutter indicator (a stable transfer
+        shows the analysis resolution, about 0.4 Hz)."""
+        for h in self.harmonics:
+            if abs(h.freq_hz - self.fundamental_hz) < 1.0:
+                return h.width_hz
+        return None
+
     def to_dict(self) -> dict:
         return {
             "detected": self.detected,
             "fundamental_hz": round(self.fundamental_hz, 3),
+            "nominal_hz": self.nominal_hz if self.detected else None,
+            "speed_error_pct": round(self.speed_error_pct, 3) if self.speed_error_pct is not None else None,
+            "line_width_hz": round(self.line_width_hz, 2) if self.line_width_hz is not None else None,
             "harmonics": [
                 {"freq_hz": round(h.freq_hz, 3), "prominence_db": round(h.prominence_db, 1),
                  "width_hz": round(h.width_hz, 2)} for h in self.harmonics],
@@ -456,8 +480,9 @@ def speech_spectrum(x: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray, np.
 
 # ----- hum ----------------------------------------------------------------
 
-_HUM_RATE = 4000            # analysis rate: keeps harmonics to 1.8 kHz, long windows cheap
-_HUM_FMAX = 1800.0
+_HUM_RATE = 12000           # analysis rate: harmonics to 5 kHz (transformer and dimmer buzz)
+_HUM_FMAX = 5000.0
+_HUM_STRICT_ABOVE_HZ = 1800.0   # above this a line must be 10 dB prominent to count
 
 
 def _median_psd(x: np.ndarray, sr: int, nperseg: int, max_segments: int = 64) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -525,7 +550,7 @@ def detect_hum(x: np.ndarray, sr: int, pause_ranges: list[tuple[int, int]] | Non
     if len(x) < 2 * sr:
         return HumReport(False, 0.0, [], "signal too short for hum analysis")
     xl = resample(x, sr, _HUM_RATE) if sr != _HUM_RATE else x
-    freqs, psd, persistent = _median_psd(xl, _HUM_RATE, nperseg=min(1 << 15, len(xl) // 2))
+    freqs, psd, persistent = _median_psd(xl, _HUM_RATE, nperseg=min(3 << 15, len(xl) // 2))
     tol = max(0.6, 2.5 * (freqs[1] - freqs[0]))
 
     best_f0, best_score = 0.0, -1.0
@@ -555,14 +580,15 @@ def detect_hum(x: np.ndarray, sr: int, pause_ranges: list[tuple[int, int]] | Non
     k = 1
     while k * f0 <= _HUM_FMAX:
         target = k * f0
+        need = min_prominence_db if target <= _HUM_STRICT_ABOVE_HZ else max(min_prominence_db, 10.0)
         fpk, prom = _prominence(freqs, psd, target, tol + 0.02 * k)
-        persistent_ok = _prominence(freqs, persistent, fpk, tol)[1] >= 0.75 * min_prominence_db
-        whole_ok = prom >= min_prominence_db and persistent_ok
+        persistent_ok = _prominence(freqs, persistent, fpk, tol)[1] >= 0.75 * need
+        whole_ok = prom >= need and persistent_ok
         if pause_psd is not None:
             pf, pp, _ = pause_psd
             ptol = max(3.0, 2.5 * (pf[1] - pf[0]))
             ppk, pprom = _prominence(pf, pp, target, ptol)
-            if pprom >= min_prominence_db:
+            if pprom >= need:
                 if not whole_ok:
                     # masked by the voice in the whole-file spectrum: locate the
                     # line precisely near the pause estimate
@@ -605,4 +631,4 @@ def _pause_psd(xl: np.ndarray, sr: int, pause_ranges, min_total_s: float = 2.0):
         w[:edge] = ramp
         w[-edge:] = ramp[::-1]
         tapered.append(p * w)
-    return _median_psd(np.concatenate(tapered), _HUM_RATE, nperseg=1 << 11, max_segments=512)
+    return _median_psd(np.concatenate(tapered), _HUM_RATE, nperseg=int(0.5 * _HUM_RATE), max_segments=512)

@@ -53,9 +53,9 @@ MIN_PROMINENCE_IN_SPEECH_DB = 8.0
 def _frame_rms(x: np.ndarray, win: int, hop: int) -> np.ndarray:
     if len(x) < win:
         return np.array([np.sqrt(np.mean(x * x) + 1e-20)])
-    from numpy.lib.stride_tricks import sliding_window_view
-    frames = sliding_window_view(x, win)[::hop]
-    return np.sqrt(np.mean(frames * frames, axis=1) + 1e-20)
+    cs = np.concatenate([[0.0], np.cumsum(x * x)])
+    starts = np.arange(0, len(x) - win + 1, hop)
+    return np.sqrt(np.maximum((cs[starts + win] - cs[starts]) / win, 0.0) + 1e-20)
 
 
 def _prominence_db(x: np.ndarray, s: int, e: int, half: int) -> tuple[float, float]:

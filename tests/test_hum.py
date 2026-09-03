@@ -60,3 +60,19 @@ def test_tracker_exact_on_stationary_tone():
     y2, refined2 = hum.track_and_subtract(x, sr, np.array([60.5]), np.array([2.0]))
     assert abs(refined2[0] - 60.2) < 0.02
     assert tone_level_db(x, 60.2, sr) - tone_level_db(y2, 60.2, sr) > 40
+
+
+def test_buzz_line_above_two_kilohertz_and_speed_report(sr):
+    """A transformer buzz line at 2.5 kHz counts (with the stricter 10 dB
+    requirement), and the mains line implies the transfer speed."""
+    v = make_voice(sr, 24.0, f0=140.0)
+    t = np.arange(len(v)) / sr
+    lines = 0.01 * np.sin(2 * np.pi * 51.0 * t) + 0.004 * np.sin(2 * np.pi * 102.0 * t + 1) + 0.003 * np.sin(2 * np.pi * 2550.0 * t + 2)
+    noisy = v + lines + at_snr(v, white(len(v)), 45)
+    an = analysis.analyze(noisy, sr)
+    assert an.hum.detected and abs(an.hum.fundamental_hz - 51.0) < 0.3
+    assert any(abs(h.freq_hz - 2550.0) < 3.0 for h in an.hum.harmonics), [h.freq_hz for h in an.hum.harmonics]
+    d = an.hum.to_dict()
+    assert d["nominal_hz"] == 50.0 and abs(d["speed_error_pct"] - 2.0) < 0.6 and d["line_width_hz"] is not None
+    y, applied = hum.remove_hum(noisy, sr, an.hum, pause_ranges=an.pause_ranges)
+    assert tone_level_db(noisy, 2550.0, sr) - tone_level_db(y, 2550.0, sr) > 20

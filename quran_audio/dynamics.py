@@ -4,18 +4,39 @@ loudness, true-peak measurement and a look-ahead true-peak limiter.
 from __future__ import annotations
 
 import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
 from scipy.ndimage import minimum_filter1d
 from scipy.signal import lfilter, resample_poly
 
-from .audio_io import _resample_filter, resample
+from .audio_io import _resample_filter
 
-# BS.1770-4 K-weighting biquads, defined at 48 kHz
+# BS.1770-4 K-weighting biquads as tabulated in the standard at 48 kHz
+# (kept for the coefficient test); the filters used are designed for the
+# signal's own sample rate from the analogue prototypes below, which is
+# what libebur128 does and what the table itself was derived from.
 _PRE_B = [1.53512485958697, -2.69169618940638, 1.19839281085285]
 _PRE_A = [1.0, -1.69065929318241, 0.73248077421585]
 _RLB_B = [1.0, -2.0, 1.0]
 _RLB_A = [1.0, -1.99004745483398, 0.99007225036621]
+_PRE_F0, _PRE_GAIN_DB, _PRE_Q = 1681.974450955533, 3.999843853973347, 0.7071752369554196
+_RLB_F0, _RLB_Q = 38.13547087602444, 0.5003270373238773
 _OS_FILTER = _resample_filter(4, 1)
+
+
+def k_weighting_coefficients(sr: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(pre_b, pre_a, rlb_b, rlb_a) for sample rate `sr`, from the analogue
+    prototypes the standard's 48 kHz table was derived from (the form used
+    by libebur128)."""
+    k = np.tan(np.pi * _PRE_F0 / sr)
+    vh = 10 ** (_PRE_GAIN_DB / 20.0)
+    vb = vh ** 0.4996667741545416
+    a0 = 1.0 + k / _PRE_Q + k * k
+    pre_b = np.array([(vh + vb * k / _PRE_Q + k * k) / a0, 2.0 * (k * k - vh) / a0, (vh - vb * k / _PRE_Q + k * k) / a0])
+    pre_a = np.array([1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / _PRE_Q + k * k) / a0])
+    k1 = np.tan(np.pi * _RLB_F0 / sr)
+    d = 1.0 + k1 / _RLB_Q + k1 * k1
+    rlb_b = np.array([1.0, -2.0, 1.0])
+    rlb_a = np.array([1.0, 2.0 * (k1 * k1 - 1.0) / d, (1.0 - k1 / _RLB_Q + k1 * k1) / d])
+    return pre_b, pre_a, rlb_b, rlb_a
 
 
 def _as_2d(x: np.ndarray) -> np.ndarray:
@@ -25,13 +46,18 @@ def _as_2d(x: np.ndarray) -> np.ndarray:
 # ----- leveler ------------------------------------------------------------
 
 def frame_rms_db(x: np.ndarray, sr: int, win_s: float = 0.05, hop_s: float = 0.01) -> tuple[np.ndarray, np.ndarray]:
+    """(frame centres in samples, RMS level in dB) with a running sum:
+    O(n) and no (frames x window) temporary, whatever the window length."""
     win = max(1, int(win_s * sr))
     hop = max(1, int(hop_s * sr))
+    x = np.asarray(x, dtype=np.float64)
     if len(x) < win:
         return np.array([len(x) / 2.0]), np.array([10.0 * np.log10(np.mean(x * x) + 1e-20)])
-    frames = sliding_window_view(x, win)[::hop]
-    levels = 10.0 * np.log10(np.mean(frames * frames, axis=1) + 1e-20)
-    centres = np.arange(len(levels)) * hop + win / 2.0
+    cs = np.concatenate([[0.0], np.cumsum(x * x)])
+    starts = np.arange(0, len(x) - win + 1, hop)
+    means = (cs[starts + win] - cs[starts]) / win
+    levels = 10.0 * np.log10(np.maximum(means, 0.0) + 1e-20)
+    centres = starts + win / 2.0
     return centres, levels
 
 
@@ -85,22 +111,29 @@ def leveler_gain(x: np.ndarray, sr: int, range_db: float = 3.0, ratio: float = 0
 
 # ----- loudness -----------------------------------------------------------
 
+def k_weight(x: np.ndarray, sr: int) -> np.ndarray:
+    pre_b, pre_a, rlb_b, rlb_a = k_weighting_coefficients(sr)
+    return lfilter(rlb_b, rlb_a, lfilter(pre_b, pre_a, x))
+
+
 def k_weight_48k(x: np.ndarray) -> np.ndarray:
-    return lfilter(_RLB_B, _RLB_A, lfilter(_PRE_B, _PRE_A, x))
+    return k_weight(x, 48000)
 
 
 def integrated_loudness(x: np.ndarray, sr: int) -> float:
-    """BS.1770-4 integrated loudness in LUFS (gated). -inf for silence."""
+    """BS.1770-4 integrated loudness in LUFS (gated), at the native rate.
+    -inf for silence."""
     x2 = _as_2d(np.asarray(x, dtype=np.float64))
-    chans = [k_weight_48k(resample(x2[:, c], sr, 48000)) for c in range(x2.shape[1])]
-    block, hop = 19200, 4800
+    chans = [k_weight(x2[:, c], sr) for c in range(x2.shape[1])]
+    block, hop = int(round(0.4 * sr)), int(round(0.1 * sr))
     n = len(chans[0])
     if n < block:
         chans = [np.concatenate([c, np.zeros(block - n)]) for c in chans]
-    ms = np.zeros(len(sliding_window_view(chans[0], block)[::hop]))
+    starts = np.arange(0, len(chans[0]) - block + 1, hop)
+    ms = np.zeros(len(starts))
     for c in chans:
-        frames = sliding_window_view(c, block)[::hop]
-        ms += np.mean(frames * frames, axis=1)
+        cs = np.concatenate([[0.0], np.cumsum(c * c)])
+        ms += (cs[starts + block] - cs[starts]) / block
     lk = -0.691 + 10.0 * np.log10(ms + 1e-20)
     abs_gate = lk > -70.0
     if not abs_gate.any():
@@ -140,7 +173,8 @@ def limiter(x: np.ndarray, sr: int, ceiling_db: float = -1.0, lookahead_ms: floa
     tp = _true_peak_envelope(x2)
     g_req = np.minimum(1.0, ceiling / np.maximum(tp, 1e-12))
     if g_req.min() >= 1.0:
-        return x, {"applied": False, "max_reduction_db": 0.0}
+        return x, {"applied": False, "max_reduction_db": 0.0,
+                   "true_peak_after_dbtp": round(float(20 * np.log10(max(float(tp.max()), 1e-12))), 2)}
     la = max(1, int(lookahead_ms * 1e-3 * sr))
     # look-ahead minimum: h[i] = min(g_req[i : i + 2 la])
     padded = np.concatenate([g_req, np.ones(la)])
@@ -166,7 +200,8 @@ def limiter(x: np.ndarray, sr: int, ceiling_db: float = -1.0, lookahead_ms: floa
     if x.ndim == 1:
         y = y[:, 0]
     return y, {"applied": True, "max_reduction_db": round(float(20 * np.log10(g_final.min())), 2),
-               "samples_over_ceiling": over}
+               "samples_over_ceiling": over,
+               "true_peak_after_dbtp": round(float(20 * np.log10(max(float(np.max(tp * g_final)), 1e-12))), 2)}
 
 
 def normalize_loudness(x: np.ndarray, sr: int, target_lufs: float = -18.0, ceiling_db: float = -1.0,
@@ -175,8 +210,8 @@ def normalize_loudness(x: np.ndarray, sr: int, target_lufs: float = -18.0, ceili
     gain_db = 0.0 if not np.isfinite(before) else float(np.clip(target_lufs - before, -max_gain_db, max_gain_db))
     y = x * 10 ** (gain_db / 20.0)
     y, lim = limiter(y, sr, ceiling_db)
-    after = integrated_loudness(y, sr)
+    after = integrated_loudness(y, sr) if lim.get("applied") else (before + gain_db if np.isfinite(before) else before)
     return y, {"loudness_before_lufs": round(before, 2) if np.isfinite(before) else None,
                "gain_db": round(gain_db, 2),
-               "loudness_after_lufs": round(after, 2) if np.isfinite(after) else None,
-               "true_peak_after_dbtp": round(true_peak_dbtp(y), 2), "limiter": lim}
+               "loudness_after_lufs": round(float(after), 2) if np.isfinite(after) else None,
+               "true_peak_after_dbtp": lim["true_peak_after_dbtp"], "limiter": lim}
