@@ -20,7 +20,7 @@ exactly as recorded.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.linalg import solve_toeplitz, toeplitz
@@ -32,11 +32,39 @@ class DeclickReport:
     clicks_repaired: int = 0
     samples_repaired: int = 0
     skipped_long: int = 0
+    skipped_weak: int = 0          # inside speech but not prominent enough to be a click
     skipped_unstable: int = 0
+    in_speech_repairs: int = 0
     passes: int = 0
+    repairs: list = field(default_factory=list)   # (time_s, samples, prominence_db, in_speech), capped
 
     def to_dict(self) -> dict:
-        return self.__dict__.copy()
+        d = {k: v for k, v in self.__dict__.items() if k != "repairs"}
+        d["repairs_logged"] = len(self.repairs)
+        d["repairs"] = [{"time_s": round(t, 3), "samples": int(n), "prominence_db": round(pr, 1), "in_speech": bool(sp)}
+                        for t, n, pr, sp in self.repairs[:MAX_LOGGED_REPAIRS]]
+        return d
+
+
+MAX_LOGGED_REPAIRS = 1000
+MIN_PROMINENCE_IN_SPEECH_DB = 8.0
+
+
+def _frame_rms(x: np.ndarray, win: int, hop: int) -> np.ndarray:
+    if len(x) < win:
+        return np.array([np.sqrt(np.mean(x * x) + 1e-20)])
+    from numpy.lib.stride_tricks import sliding_window_view
+    frames = sliding_window_view(x, win)[::hop]
+    return np.sqrt(np.mean(frames * frames, axis=1) + 1e-20)
+
+
+def _prominence_db(x: np.ndarray, s: int, e: int, half: int) -> tuple[float, float]:
+    """(peak-to-local-RMS in dB, local RMS) with the run itself excluded."""
+    n = len(x)
+    ctx = np.concatenate([x[max(0, s - half):s], x[e:min(n, e + half)]])
+    local = float(np.sqrt(np.mean(ctx * ctx) + 1e-20)) if ctx.size else 1e-10
+    peak = float(np.max(np.abs(x[s:e]))) if e > s else 0.0
+    return 20.0 * np.log10(peak / local + 1e-12), local
 
 
 def default_order(sr: int) -> int:
@@ -209,6 +237,12 @@ def declick(x: np.ndarray, sr: int, threshold: float = 6.0, max_click_ms: float 
     report = DeclickReport()
     if n < 4 * p:
         return y, report
+    # speech / pause split for the prominence gate: 50 ms frame RMS against
+    # the quietest 5 % of frames
+    half = max(8, int(0.025 * sr))
+    frms = _frame_rms(y, max(1, int(0.05 * sr)), max(1, int(0.01 * sr)))
+    floor_rms = float(np.percentile(frms, 5))
+    speech_rms = floor_rms * 10 ** (10.0 / 20.0)
     for _ in range(passes):
         report.passes += 1
         mask, wide, coefs = _detect(y, p, threshold, wide_threshold, block)
@@ -219,10 +253,20 @@ def declick(x: np.ndarray, sr: int, threshold: float = 6.0, max_click_ms: float 
         hop = block // 2
         runs = []
         for s, e, ok in _candidate_runs(mask, wide, max_len, close_gap):
-            if ok:
-                runs.append((s, e))
-            else:
+            if not ok:
                 report.skipped_long += 1
+                continue
+            prom, local = _prominence_db(y, s, e, half)
+            in_speech = local > speech_rms
+            # Inside speech a click stands well above its surroundings; a
+            # flagged sample that does not is voice, and voice is never edited.
+            if in_speech and prom < MIN_PROMINENCE_IN_SPEECH_DB:
+                report.skipped_weak += 1
+                continue
+            runs.append((s, e))
+            report.in_speech_repairs += int(in_speech)
+            if len(report.repairs) < MAX_LOGGED_REPAIRS:
+                report.repairs.append((s / sr, e - s, prom, in_speech))
         if not runs:
             break
         _repair(y, runs, lambda s: coefs.get((s // hop) * hop), p, 2 * p, report)

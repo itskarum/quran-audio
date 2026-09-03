@@ -13,6 +13,9 @@ from .audio_io import resample
 from .stft import STFT, frame_length_for
 
 _EPS = 1e-20
+SILENCE_DBFS = -85.0        # frames below this are digital silence, not noise
+VALLEY_BIAS = 3.9           # 5th percentile of 100 ms block means -> mean noise power (calibrated on synthetic voice + hiss)
+CLEAN_SNR_DB = 45.0         # above this there is no measurable noise to remove
 
 
 @dataclass
@@ -58,6 +61,10 @@ class Analysis:
     hum: HumReport
     n_fft: int = 0
     hop: int = 0
+    anchors_reliable: bool = True
+    noise_measurable: bool = True
+    silent_fraction: float = 0.0
+    notes: list[str] = field(default_factory=list)
     pause_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
     psd_freqs: np.ndarray | None = field(default=None, repr=False)
     noise_psd: np.ndarray | None = field(default=None, repr=False)
@@ -84,6 +91,10 @@ class Analysis:
             "bandwidth_hz": round(self.bandwidth_hz, 1),
             "low_edge_hz": round(self.low_edge_hz, 1),
             "hum": self.hum.to_dict(),
+            "anchors_reliable": self.anchors_reliable,
+            "noise_measurable": self.noise_measurable,
+            "silent_fraction": round(self.silent_fraction, 3),
+            "notes": list(self.notes),
         }
 
 
@@ -131,15 +142,33 @@ def analyze(x: np.ndarray, sr: int, hum_search: bool = True) -> Analysis:
     band = (freqs >= 100.0) & (freqs <= min(4000.0, 0.45 * sr))
     n_frames = st.n_frames(n)
 
-    # pass 1: per-frame in-band energy
+    # pass 1: per-frame in-band energy, plus the top of the spectrum as a
+    # noise-only proxy (no recitation has energy above 0.8 x Nyquist)
+    hf = freqs >= 0.8 * (sr / 2.0)
     band_energy = np.empty(n_frames)
+    hf_energy = np.empty(n_frames)
     for m0, power in st.power_blocks(x):
         band_energy[m0:m0 + power.shape[0]] = power[:, band].mean(axis=1)
+        hf_energy[m0:m0 + power.shape[0]] = power[:, hf].mean(axis=1) if hf.any() else 0.0
     e_db = db(band_energy)
-    floor_seed = float(np.percentile(e_db, 5))
-    near_floor = e_db[e_db < floor_seed + 6.0]
+    window_power = float(np.mean(st.window ** 2))
+    dbfs_offset = float(db(st.n_fft * window_power * 0.5))   # e_db - dbfs_offset ~ frame RMS in dBFS
+    notes: list[str] = []
+    # Digital silence and gated gaps are not evidence of the noise: a muted
+    # transfer would otherwise pin the noise floor at -300 dB and switch the
+    # denoiser off. Only "live" frames vote.
+    live = e_db > (SILENCE_DBFS + dbfs_offset)
+    silent_fraction = float(1.0 - live.mean())
+    if live.sum() < 10:
+        live = np.ones_like(live)
+    if silent_fraction > 0.02:
+        notes.append(f"{silent_fraction * 100:.0f}% of frames are digital silence; they were excluded from noise estimation")
+    floor_seed = float(np.percentile(e_db[live], 5))
+    near_floor = e_db[live & (e_db < floor_seed + 6.0)]
     noise_floor = float(np.median(near_floor)) if near_floor.size else floor_seed
-    noise_mask = e_db < noise_floor + 4.5
+    noise_mask = live & (e_db < noise_floor + 4.5)
+    if noise_mask.sum() < 10:
+        noise_mask = live & (e_db <= np.percentile(e_db[live], 10))
     speech_mask = e_db > noise_floor + 10.0
     if not speech_mask.any():             # very low SNR or silence: take the top quarter
         speech_mask = e_db >= np.percentile(e_db, 75)
@@ -168,17 +197,52 @@ def analyze(x: np.ndarray, sr: int, hum_search: bool = True) -> Analysis:
             n_speech += int(sm.sum())
     noise_psd /= max(n_noise, 1)
     speech_psd /= max(n_speech, 1)
+    pause_ranges, pause_frames, pause_psds = _pauses(run_starts, run_ends, run_acc, st, n, sr)
+
+    # Gated pauses: if the noise heard inside speech (top-of-band proxy, 5th
+    # percentile over speech frames) sits well above what the pauses show,
+    # the transfer was gated or muted between phrases and the pause
+    # spectrum under-states the noise. Fall back to minimum statistics.
+    anchors_reliable = pause_frames is not None and len(pause_frames) >= 1
+    if hf.any() and speech_mask.sum() >= 20 and noise_mask.sum() >= 10:
+        speech_hf = float(np.percentile(hf_energy[speech_mask], 5))
+        pause_hf = float(np.mean(hf_energy[noise_mask]))
+        if db(speech_hf) > db(pause_hf) + 10.0:
+            anchors_reliable = False
+            notes.append("pauses are far quieter than the noise inside speech (gated transfer); "
+                         "noise profile taken from minimum statistics instead")
+    noise_measurable = True
+    # Muted or gated gaps leave quiet voice as the quietest live frames.
+    # Against the valley floor (the stationary noise read between the
+    # harmonics), a genuine pause spectrum sits within a couple of dB; quiet
+    # voice sits far above it. The median across bins ignores hum lines.
+    valley = _valley_noise_profile(x, sr, freqs, float(np.sum(st.window ** 2)))
+    if valley is not None and n_noise >= 10:
+        voice_band = (freqs >= 200.0) & (freqs <= 2000.0)
+        excess = float(np.median(db(noise_psd[voice_band])) - np.median(db(valley[voice_band])))
+        if excess > 6.0:
+            anchors_reliable = False
+            pause_ranges = []
+            notes.append("the quietest frames contain voice, not noise (muted or gated pauses); "
+                         "noise profile taken from the spectral valley floor")
+    if not anchors_reliable and valley is not None:
+        noise_psd = valley
+        if pause_frames is None:
+            notes.append("no usable pauses; noise profile taken from the spectral valley floor")
+    elif pause_frames is None:
+        anchors_reliable = False
 
     snr = db(max(speech_psd[band].mean() - noise_psd[band].mean(), _EPS)) - db(noise_psd[band].mean())
+    if snr > CLEAN_SNR_DB:
+        noise_measurable = False
+        notes.append(f"estimated SNR {snr:.0f} dB: nothing measurable to remove, broadband denoising skipped")
     bandwidth, low_edge = _band_edges(speech_psd, noise_psd, freqs, sr)
-    pause_ranges, pause_frames, pause_psds = _pauses(run_starts, run_ends, run_acc, st, n, sr)
 
     clipped_runs, peak = count_clipped_runs(x)
     rms = float(np.sqrt(np.mean(x * x))) if n else 0.0
     # frame RMS floor in dBFS: band energy is a mean |X|^2 per bin of a
     # sqrt-Hann-windowed frame; convert to an RMS-equivalent level.
-    window_power = float(np.mean(st.window ** 2))
-    floor_dbfs = noise_floor - db(st.n_fft * window_power * 0.5) if np.isfinite(noise_floor) else -120.0
+    floor_dbfs = noise_floor - dbfs_offset if np.isfinite(noise_floor) else -120.0
 
     hum = detect_hum(x, sr, pause_ranges) if hum_search else HumReport(False, 0.0, [], "skipped")
 
@@ -195,8 +259,70 @@ def analyze(x: np.ndarray, sr: int, hum_search: bool = True) -> Analysis:
         bandwidth_hz=bandwidth, low_edge_hz=low_edge, hum=hum,
         n_fft=st.n_fft, hop=st.hop,
         pause_ranges=pause_ranges, psd_freqs=freqs, noise_psd=noise_psd, speech_psd=speech_psd,
-        pause_frames=pause_frames, pause_psds=pause_psds,
+        pause_frames=pause_frames if anchors_reliable else None,
+        pause_psds=pause_psds if anchors_reliable else None,
+        anchors_reliable=anchors_reliable, noise_measurable=noise_measurable,
+        silent_fraction=silent_fraction, notes=notes,
     )
+
+
+def _block_means(power: np.ndarray, live: np.ndarray, blen: int) -> np.ndarray:
+    """Means over `blen`-frame blocks, live frames only (NaN where a block
+    has no live frame). float32 to keep hour-long files cheap."""
+    pw = np.where(live[:, None], power, np.nan)
+    nblk = -(-pw.shape[0] // blen)
+    if nblk * blen != pw.shape[0]:
+        pw = np.concatenate([pw, np.full((nblk * blen - pw.shape[0], pw.shape[1]), np.nan)])
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanmean(pw.reshape(nblk, blen, -1), axis=1).astype(np.float32)
+
+
+def _valley_noise_profile(x: np.ndarray, sr: int, target_freqs: np.ndarray, target_window_power: float,
+                          f0_max_hz: float = 300.0, percentile: float = 5.0) -> np.ndarray | None:
+    """Noise profile read from the spectral valleys between harmonics, on
+    the denoiser's bin grid.
+
+    Measured with a Blackman-Harris window four frames long (fine bins,
+    sidelobes below -90 dB) so the gap between two harmonics really shows
+    the floor; the denoiser's own sqrt-Hann frames leak too much for that.
+    Per bin, the 5th percentile of 100 ms block means over time ignores
+    the voice's own moments in that bin; a running minimum across frequency over a little
+    more than one fundamental's span drops the harmonics themselves. The
+    result is bias-corrected and rescaled by the window power sums, which
+    is exact for stationary noise."""
+    n = len(x)
+    n_win = 4 * frame_length_for(sr)
+    hop = n_win // 4
+    if n < 2 * n_win:
+        return None
+    from numpy.lib.stride_tricks import sliding_window_view
+    from scipy.ndimage import minimum_filter1d, uniform_filter1d
+    from scipy.signal.windows import blackmanharris
+    w = blackmanharris(n_win, sym=False)
+    freqs = np.fft.rfftfreq(n_win, 1.0 / sr)
+    band = (freqs >= 100.0) & (freqs <= min(4000.0, 0.45 * sr))
+    dbfs_offset = float(db(n_win * np.mean(w ** 2) * 0.5))
+    blen = max(1, int(round(0.1 * sr / hop)))
+    frames = sliding_window_view(x, n_win)[::hop]
+    block_means: list[np.ndarray] = []
+    step = 512
+    for i in range(0, len(frames), step):
+        power = np.abs(np.fft.rfft(frames[i:i + step] * w, axis=1)) ** 2
+        live = db(power[:, band].mean(axis=1)) > SILENCE_DBFS + dbfs_offset
+        block_means.append(_block_means(power, live, blen))
+    blocks = np.concatenate(block_means, axis=0).astype(np.float64)
+    blocks = blocks[np.isfinite(blocks).all(axis=1)]
+    if blocks.shape[0] < 10:
+        return None
+    p20 = np.maximum(np.percentile(blocks, percentile, axis=0), _EPS)
+    span = max(3, int(round(1.2 * f0_max_hz / (freqs[1] - freqs[0]))) | 1)
+    valley = minimum_filter1d(p20, size=span, mode="nearest")
+    smooth = np.exp(uniform_filter1d(np.log(valley), size=span, mode="nearest"))
+    scale = target_window_power / float(np.sum(w ** 2))
+    prof = np.interp(target_freqs, freqs, smooth) * scale * VALLEY_BIAS
+    return np.maximum(prof, _EPS)
 
 
 def _band_edges(speech_psd, noise_psd, freqs, sr, margin_db: float = 3.0) -> tuple[float, float]:

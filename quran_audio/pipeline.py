@@ -56,7 +56,9 @@ class Settings:
     declip: str = "auto"                 # auto | on | off
     declip_min_runs: int = 20
     denoise: str = "auto"                # auto (= classical) | classical | dfn | off
-    denoise_floor_db: float = -18.0
+    denoise_floor_db: float = -18.0      # deepest floor, used at <= 16 dB measured SNR
+    denoise_floor_min_db: float = -8.0   # lightest floor, used at >= 28 dB measured SNR
+    denoise_adaptive: bool = True        # scale the floor with the measured SNR
     denoise_hf_floor_db: float = -40.0
     denoise_fusion: str = "soft"
     denoise_absence_prior: float = 0.5
@@ -78,14 +80,27 @@ class Settings:
 
 
 PRESETS: dict[str, dict] = {
-    "gentle": dict(declick_threshold=7.0, decrackle=False, denoise_floor_db=-12.0,
+    "gentle": dict(declick_threshold=7.0, decrackle=False, denoise_floor_db=-12.0, denoise_floor_min_db=-6.0,
                    denoise_hf_floor_db=-30.0, dfn_atten_lim_db=20.0, tonal_strength=0.3,
                    tonal_max_db=4.0, leveler=False),
     "standard": {},
-    "strong": dict(declick_threshold=5.0, decrackle=True, denoise_floor_db=-28.0,
+    "strong": dict(declick_threshold=5.0, decrackle=True, denoise_floor_db=-28.0, denoise_floor_min_db=-14.0,
                    denoise_hf_floor_db=-50.0, dfn_atten_lim_db=None, tonal_strength=0.7,
                    tonal_max_db=9.0, leveler_range_db=8.0),
 }
+
+
+def adaptive_floor_db(preset_floor_db: float, floor_min_db: float, snr_db: float) -> float:
+    """Full preset strength at <= 16 dB measured SNR, the lightest floor at
+    >= 28 dB, linear in between. A masking denoiser attenuates every
+    harmonic that sits near the noise; on a clean transfer that costs more
+    voice than it removes noise, so the floor rises with the SNR."""
+    if snr_db <= 28.0:
+        w = float(np.clip((28.0 - snr_db) / 12.0, 0.0, 1.0))
+        return float(floor_min_db + w * (preset_floor_db - floor_min_db))
+    # cleaner still: keep easing off up to 40 dB, where half the lightest floor remains
+    w = float(np.clip((snr_db - 28.0) / 12.0, 0.0, 1.0))
+    return float(floor_min_db * (1.0 - 0.5 * w))
 
 
 def make_settings(preset: str = "standard", overrides: dict | None = None) -> Settings:
@@ -144,6 +159,7 @@ def _process_channel(x: np.ndarray, sr: int, settings: Settings, backend: str, d
         rep["dc_offset_removed"] = round(offset, 6)
     x_in = x
     an = timer.run("analysis", lambda: analyze(x, sr, hum_search=settings.hum))
+    rep["notes"] = list(an.notes)
 
     if settings.hum and an.hum.detected:
         x, notches = timer.run("hum", lambda: remove_hum(x, sr, an.hum, settings.hum_min_prominence_db,
@@ -166,11 +182,18 @@ def _process_channel(x: np.ndarray, sr: int, settings: Settings, backend: str, d
     # noise profile / bandwidth after the sample-domain repairs
     an2 = timer.run("analysis", lambda: analyze(x, sr, hum_search=False))
 
-    if backend == "classical":
-        ds = DenoiseSettings(floor_db=settings.denoise_floor_db, hf_floor_db=settings.denoise_hf_floor_db,
+    if backend == "classical" and not an2.noise_measurable:
+        rep["denoise"] = {"backend": "skipped", "reason": "no measurable stationary noise", "notes": list(an2.notes)}
+    elif backend == "classical":
+        floor_db = settings.denoise_floor_db
+        if settings.denoise_adaptive:
+            floor_db = adaptive_floor_db(settings.denoise_floor_db, settings.denoise_floor_min_db, an2.snr_db)
+        ds = DenoiseSettings(floor_db=floor_db, hf_floor_db=settings.denoise_hf_floor_db,
                              bandwidth_hz=an2.bandwidth_hz, fusion=settings.denoise_fusion,
                              speech_absence_prior=settings.denoise_absence_prior)
         x, info = timer.run("denoise", lambda: denoise(x, sr, an2, ds))
+        info["snr_db_measured"] = round(float(an2.snr_db), 2)
+        info["floor_db_effective"] = round(float(floor_db), 2)
         rep["denoise"] = info
     elif backend == "dfn":
         from .denoise_dfn import denoise_dfn

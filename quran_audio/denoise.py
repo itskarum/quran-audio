@@ -38,7 +38,7 @@ class DenoiseSettings:
     alpha_noise: float = 0.8         # noise PSD smoothing (Gerkmann & Hendriks)
     spp_prior_snr_db: float = 15.0   # a priori SNR assumed under "speech present"
     spp_smooth_bins: int = 2         # +- bins of frequency smoothing on the fusion SPP
-    profile_bounds_db: tuple[float, float] = (-6.0, 6.0)  # tracker stays this close to the pause profile
+    profile_bounds_db: tuple[float, float] = (-6.0, 3.0)  # tracker stays this close to the noise profile
     spp_cap: float = 0.999           # Gerkmann-Hendriks "stuck" protection, made very gentle
     dd_track_bins: int = 1           # decision-directed term follows a harmonic drifting +- this many bins
     fusion: str = "soft"             # "soft" (sqrt of fixed-prior SPP), "spp" (OM-LSA), "xi" (from tracked a priori SNR), "none"
@@ -188,16 +188,26 @@ def denoise(x: np.ndarray, sr: int, analysis=None, settings: DenoiseSettings | N
     n_fft = frame_length_for(sr)
     st = STFT(n_fft)
     anchors = (None, None)
+    notes: list[str] = []
     if analysis is not None and analysis.noise_psd is not None and analysis.n_fft == n_fft:
         noise_psd = analysis.noise_psd
-        anchors = (analysis.pause_frames, analysis.pause_psds)
+        overrides = {}
         if settings.bandwidth_hz is None:
-            settings = DenoiseSettings(**{**settings.to_dict(), "bandwidth_hz": analysis.bandwidth_hz})
+            overrides["bandwidth_hz"] = analysis.bandwidth_hz
+        if getattr(analysis, "anchors_reliable", True):
+            anchors = (analysis.pause_frames, analysis.pause_psds)
+        else:
+            # the valley-floor profile is calibrated to within a couple of dB;
+            # a tight upper bound keeps the tracker off the analysis window's
+            # leakage between harmonics, which it would otherwise learn as noise
+            notes.append("pause anchors unusable; tracker running on the valley-floor profile")
+        if overrides:
+            settings = DenoiseSettings(**{**settings.to_dict(), **overrides})
     else:
         noise_psd = noise_profile(x, st)
     proc = SpectralDenoiser(sr, n_fft, noise_psd, settings, *anchors)
     y = st.process(x, proc, block_frames=block_frames)
     info = {"backend": "classical-omlsa", "n_fft": n_fft, "hop": st.hop, "frames": proc.frames,
-            "pause_anchors": int(len(proc.anchor_frames))}
+            "pause_anchors": int(len(proc.anchor_frames)) if anchors[0] is not None else 0, "notes": notes}
     info.update(settings.to_dict())
     return y, info

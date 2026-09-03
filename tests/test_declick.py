@@ -69,3 +69,19 @@ def test_lsar_fill_interpolates_sine():
     filled = declick.lsar_fill(seg, unknown, a)
     assert np.max(np.abs(filled[unknown] - x[unknown])) < 1e-3
     assert declick.ar_coefficients(np.zeros(400), 8) is None
+
+
+def test_in_speech_repairs_need_prominence(voice, sr):
+    """Flagged samples inside speech are only repaired when they stand well
+    above their surroundings; everything else is voice and stays."""
+    from conftest import at_snr, white
+    rng = np.random.default_rng(7)
+    sig = voice + at_snr(voice, white(len(voice), 4), 40)
+    pos = rng.integers(2000, len(sig) - 2000, 40)
+    for p_ in pos:
+        sig[p_:p_ + 2] += 0.9 * rng.choice([-1, 1])           # unmistakable clicks
+    y, rep = declick.declick(sig, sr)
+    assert rep.clicks_repaired >= 30
+    assert all(r[2] >= declick.MIN_PROMINENCE_IN_SPEECH_DB for r in rep.repairs if r[3])
+    d = rep.to_dict()
+    assert d["repairs_logged"] == len(d["repairs"]) and "skipped_weak" in d

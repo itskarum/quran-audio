@@ -75,3 +75,20 @@ def test_hum_confirmed_in_pauses(sr):
     an = analysis.analyze(noisy, sr)
     assert an.hum.detected and abs(an.hum.fundamental_hz - 60.0) < 0.15
     assert "pauses" in an.hum.note
+
+
+def test_muted_gaps_do_not_poison_the_noise_profile(voice, sr):
+    """An edited transfer with digital silence between phrases must not
+    hand the denoiser a profile made of quiet voice."""
+    from conftest import at_snr, white
+    noisy = voice + at_snr(voice, white(len(voice)), 20)
+    ok = analysis.analyze(noisy, sr, hum_search=False)
+    edited = noisy.copy()
+    for a, b in ok.pause_ranges:
+        edited[a:b] = 0.0
+    an = analysis.analyze(edited, sr, hum_search=False)
+    assert not an.anchors_reliable and any("valley floor" in n for n in an.notes)
+    band = (ok.psd_freqs >= 200) & (ok.psd_freqs <= 2000)
+    diff = 10 * np.log10(an.noise_psd[band].mean() / ok.noise_psd[band].mean())
+    assert abs(diff) < 4.0, diff
+    assert an.snr_db > ok.snr_db - 4.0
