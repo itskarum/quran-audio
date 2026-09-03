@@ -244,3 +244,7 @@ Layout: `quran_audio/audio_io.py` (decode/encode/resample), `stft.py`,
 hashes. DeepFilterNet (MIT/Apache-2.0, Schröter et al.) is used unmodified;
 its unmaintained audio-I/O helper is stubbed out at import because the
 tool does its own I/O.
+
+## License
+
+MIT. See `LICENSE`.

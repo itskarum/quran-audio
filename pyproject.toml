@@ -3,6 +3,7 @@ name = "quran-audio"
 version = "0.1.0"
 description = "Restoration tool for old, noisy Quran recitation recordings: dehum, declick, denoise, and clarify the voice without ever changing what the reciter says."
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = [
     # Versions verified in the dev environment on 2026-09-03:
