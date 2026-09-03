@@ -25,7 +25,7 @@ from typing import Callable
 
 import numpy as np
 
-from . import __version__
+from . import __version__, fidelity
 from .analysis import Analysis, analyze, speech_spectrum
 from .audio_io import fit_length, load, remove_dc, resample, resampled_length, save, to_mono
 from .declick import declick, declip
@@ -174,6 +174,7 @@ def _process_group(chans: list[np.ndarray], sr: int, settings: Settings, backend
             x, offset = remove_dc(x)
             reps[c]["dc_offset_removed"] = round(offset, 6)
         xs.append(x)
+    inputs = list(xs)
 
     def mid_of(sig: list[np.ndarray]) -> np.ndarray:
         return sig[0] if len(sig) == 1 else np.mean(np.stack(sig, axis=0), axis=0)
@@ -269,6 +270,12 @@ def _process_group(chans: list[np.ndarray], sr: int, settings: Settings, backend
 
     if any(len(x) != n for x in xs) or any(len(x) != n for x in pres):
         raise AssertionError("internal error: a stage changed the sample count")
+
+    # did the restoration stages leave the voice alone? measured on the mid
+    fid = timer.run("fidelity", lambda: fidelity.measure(mid_of(inputs), mid_of(pres), sr, reps[0].get("declick")))
+    for c in range(len(xs)):
+        reps[c]["fidelity"] = fid
+        reps[c]["notes"] = reps[c].get("notes", []) + [f"fidelity: {w}" for w in fid["warnings"]]
     return pres, xs, reps, an
 
 
@@ -330,7 +337,8 @@ def enhance_signal(samples: np.ndarray, sr: int, settings: Settings | None = Non
         "input": {"sample_rate": sr, "channels": ch_in, "samples": n_in, "duration_s": round(n_in / sr, 3),
                   "mono_strategy": strategy},
         "stereo": stereo_rep.to_dict() if stereo_rep is not None else None,
-        "denoise_backend": backend, "notes": [note] if note else [],
+        "denoise_backend": backend, "notes": ([note] if note else []) + [w for r in reps for w in r.get("notes", []) if w.startswith("fidelity:")],
+        "fidelity": reps[0].get("fidelity"),
         "analysis_before": analyses[0].to_dict(),
         "channels": reps,
         "loudness": loud,

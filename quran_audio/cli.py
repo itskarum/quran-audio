@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__
+from . import __version__, fidelity
 from .pipeline import PRESETS, enhance_file, make_settings
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".wma",
@@ -87,6 +87,8 @@ def _summary(r: dict) -> None:
     ch = r["channels"][0]
     rel_b = b["noise_floor_dbfs"] - b["rms_dbfs"]
     rel_a = a["noise_floor_dbfs"] - a["rms_dbfs"]
+    if r.get("fidelity"):
+        _log("fidelity: " + fidelity.summary(r["fidelity"]))
     _log(f"backend={r['denoise_backend']} hum={len(ch.get('hum_notches', []))} notches "
          f"clicks={ch.get('declick', {}).get('clicks_repaired', 0)} "
          f"noise floor rel. to signal {rel_b:.1f} -> {rel_a:.1f} dB, "
