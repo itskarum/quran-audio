@@ -6,12 +6,13 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = [
-    # Versions verified in the dev environment on 2026-09-03:
-    # numpy 2.4.6, scipy 1.17.1, soundfile 0.14.0 (bundles libsndfile
+    # Runs on the current release of each: verified on Python 3.13 with
+    # numpy 2.5.2, scipy 1.18.1, soundfile 0.14.0 (bundles libsndfile
     # 1.2.2 with MP3/FLAC/OGG codecs). Caps stop a major bump from
-    # silently changing DSP numerics. `uv.lock` pins the exact set.
-    # numpy 1.26 is allowed only so the `dfn` extra can resolve (the
-    # deepfilternet package pins numpy < 2); the suite runs on both.
+    # silently changing DSP numerics; requirements-lock.txt pins an exact
+    # Linux x86-64 set. numpy 1.26 is allowed only so the `dfn` extra can
+    # resolve (deepfilterlib ships wheels for CPython 3.8-3.11 and pins
+    # numpy < 2, so it needs its own Python 3.11 env); the suite runs on both.
     "numpy>=1.26,<3.0",
     "scipy>=1.14,<2.0",
     "soundfile>=0.13,<1.0",

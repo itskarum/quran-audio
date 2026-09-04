@@ -32,19 +32,33 @@ That promise is kept structurally, and then measured on every run:
 Python 3.11 or newer. The core needs only numpy, scipy and libsndfile
 (bundled with the `soundfile` wheel, which decodes WAV, FLAC, MP3, OGG and
 AIFF). Anything else (M4A, WMA, video containers) is decoded through
-`ffmpeg` if it is on your PATH.
+`ffmpeg` if it is on your PATH. The core runs on the current release of
+every dependency (verified on Python 3.13 with numpy 2.5, scipy 1.18,
+soundfile 0.14).
 
 ```bash
 cd quran-audio
-python -m venv .venv && . .venv/bin/activate
-pip install -e .            # or: pip install -r requirements-lock.txt -e .
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e .            # or: pip install -r requirements-lock.txt -e .   (pinned, Linux x86-64)
 quran-audio --version
 ```
 
-Optional, **experimental**, deep denoiser (DeepFilterNet3; CPU is fine):
+Or with [uv](https://docs.astral.sh/uv/), which fetches the interpreter too:
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU-only build, much smaller
+uv venv --python 3.13 && uv pip install -e '.[test,eval]'
+uv run quran-audio --version
+```
+
+Optional, **experimental**, deep denoiser (DeepFilterNet3; CPU is fine). It
+needs its **own environment on Python 3.11**: the `deepfilterlib` wheel is
+unmaintained and published only for CPython 3.8–3.11 (including
+Apple-Silicon arm64), and it pins numpy below 2, so it cannot share the
+core's up-to-date environment.
+
+```bash
+python3.11 -m venv .venv-dfn && . .venv-dfn/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # omit --index-url on Apple Silicon for the Metal/MPS build
 pip install -e '.[dfn]'
 quran-audio fetch-models    # ~8 MB, verified against a pinned SHA-256
 ```
