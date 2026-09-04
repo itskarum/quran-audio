@@ -65,7 +65,7 @@ def _add_processing_options(p: argparse.ArgumentParser) -> None:
 
 def _settings_from_args(args: argparse.Namespace):
     keys = ["denoise", "denoise_floor_db", "dfn_atten_lim_db", "dfn_model", "hum", "declick", "decrackle",
-            "declip", "highpass", "lowpass", "tonal_balance", "tonal_strength", "tonal_reference", "leveler", "target_lufs", "speed_correct",
+            "declip", "highpass", "lowpass", "tonal_balance", "tonal_strength", "tonal_reference", "tail_preserve", "leveler", "target_lufs", "speed_correct",
             "dither", "mp3_kbps", "provenance", "breath_db",
             "true_peak_db", "output_sr", "channels", "mono_strategy", "output_subtype"]
     overrides = {k: getattr(args, k) for k in keys if getattr(args, k, None) is not None}

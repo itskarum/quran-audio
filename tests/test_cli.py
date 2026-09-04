@@ -67,3 +67,21 @@ def test_breath_option_reaches_the_report(tmp_path):
     r = json.loads(rep.read_text())
     assert r["settings"]["breath_db"] == -6.0
     assert r["channels"][0]["breath"]["attenuation_db"] == -6.0
+
+
+def test_store_false_flags_reach_settings():
+    """Every --no-* / opt-out flag must be merged into Settings. A dest
+    missing from the merge list is parsed and silently dropped, which is
+    how --no-tail-preserve was once a no-op."""
+    from quran_audio.cli import _settings_from_args, build_parser
+    p = build_parser()
+    args = p.parse_args(["enhance", "in.wav", "out.wav", "--no-tail-preserve",
+                         "--no-hum", "--no-declick", "--no-highpass", "--no-lowpass",
+                         "--no-tonal-balance"])
+    s = _settings_from_args(args)
+    assert s.tail_preserve is False
+    assert s.hum is False and s.declick is False
+    assert s.highpass is False and s.lowpass is False and s.tonal_balance is False
+    # and the defaults survive when the flags are absent
+    d = _settings_from_args(p.parse_args(["enhance", "in.wav", "out.wav"]))
+    assert d.tail_preserve is True and d.hum is True
